@@ -62,7 +62,7 @@
     const Inp = (p) => <input {...p} className={"border border-gray-300 rounded px-2 py-1 text-sm w-full " + (p.className || '')} />;
     const Num = (p) => <input type="number" min="0" {...p} className="border border-gray-300 rounded px-2 py-1 text-sm w-16" />;
     const Sel = ({ className, children, ...p }) => <select {...p} className={"border border-gray-300 rounded px-2 py-1 text-sm " + (className || 'w-full')}>{children}</select>;
-    const Chk = ({ checked, onChange }) => <input type="checkbox" checked={checked} onChange={onChange} className="w-4 h-4 accent-blue-600" />;
+    const Chk = ({ checked, onChange, ...p }) => <input {...p} type="checkbox" checked={checked} onChange={onChange} className="w-4 h-4 accent-blue-600" />;
     const Lbl = ({ children }) => <label className="block text-xs font-medium text-gray-600 mb-1">{children}</label>;
     const AddBtn = ({ onClick, children }) => (
       <button onClick={onClick} className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800 mt-2">＋ {children}</button>
@@ -165,6 +165,11 @@
         return netCabs[0] ? netCabs[0].id : (racks[0] ? racks[0].id : null);
       };
       const effNet = (id) => netCabs.some(c => c.id === id) ? id : (netCabs[0] ? netCabs[0].id : null);
+      const effAutoTarget = (id, sourceId) => {
+        if (id !== sourceId && autoCabs.some(c => c.id === id)) return id;
+        const target = autoCabs.find(c => c.id !== sourceId);
+        return target ? target.id : null;
+      };
 
       const perRow = Math.max(1, Number(project.blocksPerRow) || 1);
       const hasExternal = netCabs.some(c => c.external);
@@ -248,9 +253,20 @@
           const t = blk[effNet(b.item.netTarget)];
           if (t) conns.push({ src: b, tgt: t, color: COLORS['Витая пара'] });
         });
+        const rs485CabLinks = new Set();
         LV.auto.blocks.forEach(b => {
           const t = blk[effNet(b.item.netTarget)];
           if (t) conns.push({ src: b, tgt: t, color: COLORS[b.item.uplink] || COLORS['Витая пара'] });
+
+          if (b.item.rs485Cab) {
+            const targetId = effAutoTarget(b.item.rs485Target, b.id);
+            const target = blk[targetId];
+            const linkKey = target ? [b.id, target.id].sort().join('|') : null;
+            if (target && !rs485CabLinks.has(linkKey)) {
+              rs485CabLinks.add(linkKey);
+              conns.push({ src: b, tgt: target, color: COLORS['RS-485'] });
+            }
+          }
         });
 
         // ---- грани выхода/входа и основная полоса ----
@@ -436,10 +452,7 @@
       const totalH = notesY + (noteLines.length ? 20 + noteLines.length * 16 : 0) + 24;
 
       // ---------- ОПИСАНИЯ БЛОКОВ ----------
-      const opLines = (it) => {
-        const tId = effTarget(it.target, true);
-        return [it.type, `Связь: ${tId === 'kvmpanel' ? 'KVM' : it.link}`];
-      };
+      const opLines = (it) => [it.type];
       const panelLines = () => ['KVM-удлинители', `Стоек подключено: ${racks.filter(r => r.kvm).length}`];
       const rackLines = (r) => {
         const l = [`Серверов: ${r.servers}`];
@@ -602,6 +615,11 @@
           {netCabs.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
         </Sel>
       );
+      const AutoTargetSelect = ({ sourceId, value, onChange }) => (
+        <Sel value={effAutoTarget(value, sourceId) || ''} onChange={onChange}>
+          {autoCabs.filter(c => c.id !== sourceId).map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+        </Sel>
+      );
 
       const tabs = [
         ['project', 'Проект'], ['op', 'Операторная'], ['srv', 'Серверная'], ['auto', 'Шкафы автоматики'],
@@ -744,7 +762,8 @@
                     <div className="w-28 shrink-0">Связь сверху</div><div className="w-44 shrink-0">Куда</div>
                     <div className="w-8 shrink-0">DI</div><div className="w-8 shrink-0">DO</div>
                     <div className="w-8 shrink-0">AI</div><div className="w-8 shrink-0">AO</div>
-                    <div className="w-12 shrink-0">RS-485</div><div></div>
+                    <div className="w-16 shrink-0">RS-485 вниз</div>
+                    <div className="w-24 shrink-0">RS-485 между</div><div className="w-44 shrink-0">Связать со шкафом</div><div></div>
                   </div>
                   {autoCabs.map(c => (
                     <div key={c.id} className="flex items-start gap-2 mb-1">
@@ -765,11 +784,19 @@
                           )}
                         </div>
                       ))}
-                      <div className="w-12 shrink-0 pt-1"><Chk checked={c.rs485} onChange={e => updAuto(c.id, 'rs485', e.target.checked)} /></div>
+                      <div className="w-16 shrink-0 pt-1"><Chk checked={c.rs485} onChange={e => updAuto(c.id, 'rs485', e.target.checked)} /></div>
+                      <div className="w-24 shrink-0 pt-1">
+                        <Chk checked={!!c.rs485Cab} disabled={autoCabs.length < 2} onChange={e => updAuto(c.id, 'rs485Cab', e.target.checked)} />
+                      </div>
+                      <div className="w-44 shrink-0">
+                        {c.rs485Cab && autoCabs.length > 1
+                          ? <AutoTargetSelect sourceId={c.id} value={c.rs485Target} onChange={e => updAuto(c.id, 'rs485Target', e.target.value)} />
+                          : <span className="text-gray-300 text-xs">—</span>}
+                      </div>
                       <DelBtn onClick={() => del(setAutoCabs)(c.id)} />
                     </div>
                   ))}
-                  <AddBtn onClick={() => setAutoCabs([...autoCabs, { id: uid(), name: 'Шкаф ША-' + pad2(autoCabs.length + 1), ctrls: 1, uplink: 'Витая пара', netTarget: netCabs[0] ? netCabs[0].id : null, di: true, dO: true, ai: true, ao: false, rs485: false, diN: 16, doN: 8, aiN: 8, aoN: 0 }])}>Добавить шкаф</AddBtn>
+                  <AddBtn onClick={() => setAutoCabs([...autoCabs, { id: uid(), name: 'Шкаф ША-' + pad2(autoCabs.length + 1), ctrls: 1, uplink: 'Витая пара', netTarget: netCabs[0] ? netCabs[0].id : null, di: true, dO: true, ai: true, ao: false, rs485: false, rs485Cab: false, rs485Target: autoCabs[0] ? autoCabs[0].id : null, diN: 16, doN: 8, aiN: 8, aoN: 0 }])}>Добавить шкаф</AddBtn>
                 </div>
               )}
             </div>
