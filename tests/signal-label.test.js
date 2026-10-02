@@ -18,6 +18,7 @@ test('signal labels preserve an explicitly configured zero count', () => {
   const signalLabel = loadSignalLabel();
 
   assert.equal(signalLabel({ k: 'AO', n: 0 }, true), 'AO (0)');
+  assert.equal(signalLabel({ k: 'AI', n: '' }, true), 'AI');
   assert.equal(signalLabel({ k: 'DI', n: 16 }, true), 'DI (16)');
   assert.equal(signalLabel({ k: 'RS-485' }, true), 'RS-485');
   assert.equal(signalLabel({ k: 'AO', n: 0 }, false), 'AO');

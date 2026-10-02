@@ -40,7 +40,7 @@
     const fit = (s, n) => { s = String(s == null ? '' : s); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
     const pad2 = n => String(n).padStart(2, '0');
     const signalLabel = (signal, showCounts) =>
-      showCounts && signal.n != null ? `${signal.k} (${signal.n})` : signal.k;
+      showCounts && signal.n != null && signal.n !== '' ? `${signal.k} (${signal.n})` : signal.k;
 
     const NET1_ID = uid();
     const RACK1_ID = uid();
