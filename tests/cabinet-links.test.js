@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 
-const htmlPath = path.join(__dirname, '..', 'Structural Scheme 2026.09.04.html');
+const htmlPath = path.join(__dirname, '..', 'Structural Scheme 2026.10.02.html');
 const source = fs.readFileSync(htmlPath, 'utf8');
 
 test('optional RS-485 cabinet links are routed as regular connections', () => {
