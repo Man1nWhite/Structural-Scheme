@@ -39,6 +39,8 @@
     };
     const fit = (s, n) => { s = String(s == null ? '' : s); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
     const pad2 = n => String(n).padStart(2, '0');
+    const signalLabel = (signal, showCounts) =>
+      showCounts && signal.n != null ? `${signal.k} (${signal.n})` : signal.k;
 
     const NET1_ID = uid();
     const RACK1_ID = uid();
@@ -548,7 +550,7 @@
           sigs.forEach((s, i) => {
             const sx = b.x + b.w * (i + 1) / (sigs.length + 1);
             const ey = b.y + b.h + 44;
-            const label = project.showSignalCounts && s.n ? `${s.k} (${s.n})` : s.k;
+            const label = signalLabel(s, project.showSignalCounts);
             const exitX = ((i + 1) / (sigs.length + 1)).toFixed(3);
             cells.push(`<mxCell id="e${eid++}" value="${xesc(label)}" style="endArrow=block;endFill=1;html=1;strokeWidth=2;strokeColor=${COLORS[s.k]};fontColor=${COLORS[s.k]};fontSize=9;fontStyle=1;verticalAlign=bottom;exitX=${exitX};exitY=1;exitDx=0;exitDy=0;" edge="1" parent="1" source="b_${b.id}"><mxGeometry relative="1" as="geometry"><mxPoint x="${R(sx)}" y="${R(ey)}" as="targetPoint"/></mxGeometry></mxCell>`);
           });
@@ -814,7 +816,7 @@
                   return sigs.map((s, i) => {
                     const sx = b.x + b.w * (i + 1) / (sigs.length + 1);
                     const ey = b.y + b.h + 44;
-                    const label = project.showSignalCounts && s.n ? `${s.k} (${s.n})` : s.k;
+                    const label = signalLabel(s, project.showSignalCounts);
                     return (
                       <g key={b.id + s.k}>
                         <line x1={sx} y1={b.y + b.h} x2={sx} y2={ey - 6} stroke={COLORS[s.k]} strokeWidth="1.7" />
