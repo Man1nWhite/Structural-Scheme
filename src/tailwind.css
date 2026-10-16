@@ -1,0 +1,4 @@
+/* Исходник для src/styles.css. Пересборка: npm run build:css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
