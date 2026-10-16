@@ -43,6 +43,14 @@
   const pad2 = n => String(n).padStart(2, '0');
   const signalLabel = (signal, showCounts) =>
     showCounts && signal.n != null && signal.n !== '' ? `${signal.k} (${signal.n})` : signal.k;
+  // Блоков в ряду: значение из поля ввода может быть строкой, пустым или мусором.
+  // Верхний предел нужен, чтобы лист не растянулся на десятки тысяч пикселей
+  // (экспорт в PNG ограничен размерами canvas).
+  const PER_ROW_MAX = 12;
+  const clampPerRow = (value) => {
+    const n = Math.floor(Number(value));
+    return Number.isFinite(n) ? Math.min(PER_ROW_MAX, Math.max(1, n)) : 1;
+  };
   const signalsOf = (c) => {
     const s = [];
     if (c.di) s.push({ k: 'DI', n: c.diN });
@@ -53,6 +61,16 @@
     return s;
   };
   const fileNameOf = (project) => (project.fileName || 'scheme').replace(/[^\wа-яА-ЯёЁ-]+/g, '_');
+
+  // ---------- Экспорт растровой картинки ----------
+  // Браузеры отказываются растрировать слишком большой лист: canvas ограничен по
+  // площади, и вместо картинки приходит пустой результат. Считаем масштаб заранее.
+  const RASTER_SCALE = 2;          // обычный масштаб вывода — для чёткости линий
+  const RASTER_MAX_PIXELS = 16e6;  // предел площади canvas (учитывает лимиты браузеров)
+  const rasterScale = (width, height) => {
+    const fit = Math.sqrt(RASTER_MAX_PIXELS / Math.max(1, width * height));
+    return Math.max(0.1, Math.min(RASTER_SCALE, fit));
+  };
 
   // ---------- Геометрия ----------
   const BW = 190;        // ширина блока
@@ -176,6 +194,10 @@
       throw new Error('Проект сохранён в более новом формате, обновите приложение.');
     }
     const state = { project: pickKnown(raw.project, PROJECT_DEFAULTS) };
+    // Из поля ввода число приходит строкой: сохраняем строку, если в ней было число.
+    const perRow = state.project.blocksPerRow;
+    const wasNumber = typeof perRow === 'string' && perRow.trim() !== '' && Number.isFinite(Number(perRow));
+    state.project.blocksPerRow = wasNumber ? String(clampPerRow(perRow)) : clampPerRow(perRow);
     const seen = new Set([KVM_PANEL_ID]);
     LIST_KEYS.forEach(k => {
       const list = Array.isArray(raw[k]) ? raw[k] : [];
@@ -265,7 +287,7 @@
   function layout(state, GAPX) {
     const { project, opItems, racks, netCabs, autoCabs } = state;
     const { effTarget, effNet, effAutoTarget } = makeResolvers(state);
-    const perRow = Math.max(1, Number(project.blocksPerRow) || 1);
+    const perRow = clampPerRow(project.blocksPerRow);
     const hasExternal = netCabs.some(c => c.external);
     const titleH = project.subtitle ? 82 : 58;
 
@@ -378,10 +400,46 @@
       }
     });
 
+    // Створ — место, где идут вертикали: колонка блока (точки выхода и входа)
+    // или межколоночный зазор (обход соседних рядов). Списки занятых координат
+    // общие для всего листа: створы разных уровней часто стоят на одной оси,
+    // а вертикали из разных уровней встречаются у общих коридоров. В каждом
+    // створе координаты занимаются по одной, иначе две связи лягут в одну линию
+    // и схема станет неоднозначной (tests/routing.test.js, «связи идут по одной линии»).
+    const SEAT_EPS = 5;        // ближе этого две вертикали визуально сливаются
+    const seatsByLevel = new Map();     // уровень → занятые координаты в створах
+    const seatsByCorridor = new Map();  // коридор → занятые координаты вертикалей в нём
+    const listOf = (map, key) => { if (!map.has(key)) map.set(key, []); return map.get(key); };
+    const seat = (list, ideal, step, lo, hi, guard) => {
+      const busy = (arr, x) => arr.some(v => Math.abs(v - x) < SEAT_EPS);
+      const fits = x => x >= lo - 0.01 && x <= hi + 0.01 && !busy(list, x) && !(guard && busy(guard, x));
+      const take = x => { list.push(x); if (guard) guard.push(x); return x; };
+      // Сначала пробуем места с обычным шагом, затем — ближайшее свободное с точностью
+      // до пикселя: створ может быть тесным, но линии не должны совпадать.
+      for (let k = 0; k < 200; k++) {
+        const candidates = k === 0 ? [ideal] : [ideal + k * step, ideal - k * step];
+        for (const x of candidates) if (fits(x)) return take(x);
+      }
+      for (let d = 0; d <= hi - lo + 1; d++) {
+        for (const x of [ideal + d, ideal - d]) if (fits(x)) return take(x);
+      }
+      return take(ideal);
+    };
+    // Коридор общий для двух соседних уровней: их вертикали встречаются там при
+    // одинаковом x, поэтому координаты в коридоре занимаются общим списком.
+    const corridorOf = c => c.band.kind === 'corridor' ? listOf(seatsByCorridor, c.band.id) : null;
+    const spreadStep = (width, count) => count > 1 ? Math.min(EXIT_STEP, (width - 20) / (count - 1)) : EXIT_STEP;
+
     // ---- точки выхода: разнос по грани в порядке положения целей ----
     groupBy(conns, c => c.src.id + '|' + c.sEdge).forEach(g => {
+      const S = g[0].src;
       g.sort((a, b) => cx(a.tgt) - cx(b.tgt));
-      g.forEach((c, i) => { c.sx = cx(c.src) + (i - (g.length - 1) / 2) * EXIT_STEP; });
+      const step = spreadStep(S.w, g.length);
+      const list = listOf(seatsByLevel, S.level);
+      g.forEach((c, i) => {
+        const ideal = cx(S) + (i - (g.length - 1) / 2) * step;
+        c.sx = seat(list, ideal, step, S.x + 10, S.x + S.w - 10, corridorOf(c));
+      });
     });
 
     // ---- подход от грани блока к полосе: прямой либо через межколоночный зазор ----
@@ -401,18 +459,27 @@
       if (!blocked) return { x: px, run: null, jog: null };
       const dir = otherX >= cx(B) ? 'R' : 'L';           // в какую сторону от блока уходим
       const g = dir === 'R' ? B.col + 1 : B.col;          // зазор g — между колонками g-1 и g
-      const run = { g, side: dir === 'R' ? 'L' : 'R', len, px, ax: cx(B) };
+        const run = { g, side: dir === 'R' ? 'L' : 'R', len, px, ax: null, corridor: c.band.kind === 'corridor' ? c.band.id : null };
       (L.gapRuns[g] = L.gapRuns[g] || []).push(run);
       return { x: px, run, jog: edge === 'bottom' ? L.bands[B.row] : L.bands[B.row - 1] };
     };
     const proxyOf = a => a.run ? a.run.ax : a.x;
+    // Раздача мест вертикалям в межколоночных зазорах: сначала источники, затем
+    // цели. Уже назначенные координаты не пересчитываются, иначе порядок точек
+    // входа, выбранный по координатам источников, разъезжается с ними.
     const assignSlots = () => levels.forEach(L => Object.keys(L.gapRuns).forEach(k => {
-      const g = Number(k), runs = L.gapRuns[k];
+      const g = Number(k), runs = L.gapRuns[k].filter(r => r.ax == null);
+      if (!runs.length) return;
       const gl = L.startX + g * colStep - GAPX;
-      const Ls = runs.filter(r => r.side === 'L').sort((a, b) => a.len - b.len || a.px - b.px);
-      const Rs = runs.filter(r => r.side === 'R').sort((a, b) => a.len - b.len || b.px - a.px);
-      Ls.forEach((r, i) => { r.ax = gl + SLOT_M + i * SLOT; });
-      Rs.forEach((r, i) => { r.ax = gl + GAPX - SLOT_M - i * SLOT; });
+      const list = listOf(seatsByLevel, L.key);
+      ['L', 'R'].forEach(side => {
+        const rs = runs.filter(r => r.side === side).sort((a, b) => a.len - b.len || a.px - b.px);
+        rs.forEach(r => {
+          const ideal = side === 'L' ? gl + SLOT_M : gl + GAPX - SLOT_M;
+          const guard = r.corridor ? listOf(seatsByCorridor, r.corridor) : null;
+          r.ax = seat(list, ideal, side === 'L' ? SLOT : -SLOT, gl + SLOT_M, gl + GAPX - SLOT_M, guard);
+        });
+      });
     }));
 
     conns.forEach(c => { c.sApp = approach(c, true, cx(c.tgt)); });
@@ -427,15 +494,24 @@
         if (ka !== kb) return ka - kb;
         return ka === 1 ? proxyOf(a.sApp) - proxyOf(b.sApp) : b.sx - a.sx;
       });
-      g.forEach((c, j) => { c.tx = T.x + T.w * (j + 1) / (g.length + 1); });
+      const step = spreadStep(T.w, g.length);
+      const list = listOf(seatsByLevel, T.level);
+      g.forEach((c, j) => {
+        c.tx = seat(list, T.x + T.w * (j + 1) / (g.length + 1), step, T.x + 10, T.x + T.w - 10, corridorOf(c));
+      });
     });
     conns.forEach(c => { c.tApp = approach(c, false, proxyOf(c.sApp)); });
     assignSlots();
 
-    let needGap = 0;
-    levels.forEach(L => Object.values(L.gapRuns).forEach(runs => {
-      needGap = Math.max(needGap, 2 * SLOT_M + (runs.length - 1) * SLOT);
+    // Зазоры соседних уровней обычно стоят на одной оси: вертикали обоих уровней
+    // идут по одному столбцу, поэтому ширину зазора считаем сразу на все уровни.
+    const stripRuns = new Map();
+    levels.forEach(L => Object.keys(L.gapRuns).forEach(k => {
+      const key = (L.startX + Number(k) * colStep - GAPX).toFixed(1);
+      stripRuns.set(key, (stripRuns.get(key) || 0) + L.gapRuns[k].length);
     }));
+    let needGap = 0;
+    stripRuns.forEach(n => { needGap = Math.max(needGap, 2 * SLOT_M + (n - 1) * SLOT); });
 
     // ---- горизонтальные участки → полосы ----
     const mk = (a, b) => ({ x1: Math.min(a, b), x2: Math.max(a, b), top: [], bot: [], track: 0 });
@@ -496,7 +572,9 @@
       const my = trackY(c.band, c.main.track); pts.push([sX, my], [tX, my]);
       if (c.tApp.run) { const jy = trackY(c.tApp.jog, c.tJog.track); pts.push([tX, jy], [c.tx, jy]); }
       pts.push([c.tx, c.ty]);
-      c.pts = pts;
+      // Совпадающие соседние точки не нужны: они дают пустые отрезки в SVG
+      // и лишние mxPoint в Draw.io.
+      c.pts = pts.filter((p, i) => i === 0 || Math.abs(p[0] - pts[i - 1][0]) > 0.01 || Math.abs(p[1] - pts[i - 1][1]) > 0.01);
     });
 
     // ---- внешняя связь ----
@@ -770,7 +848,8 @@
   return {
     COLORS, NAME_BY_COLOR, OP_TYPES, OP_LINKS, AUTO_UPLINKS, KVM_PANEL_ID,
     PROJECT_DEFAULTS, ITEM_DEFAULTS, FORMAT, FORMAT_VERSION, STORAGE_KEY,
-    uid, fit, pad2, signalLabel, signalsOf, fileNameOf, routeBand,
+    PER_ROW_MAX, RASTER_SCALE, RASTER_MAX_PIXELS,
+    uid, fit, pad2, clampPerRow, rasterScale, signalLabel, signalsOf, fileNameOf, routeBand,
     createDefaultState, newOpItem, newRack, newNetCab, newAutoCab,
     serializeState, normalizeState, parseState, makeResolvers,
     buildScheme, toSvg, toDrawio,

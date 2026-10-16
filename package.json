@@ -1,12 +1,13 @@
 {
   "name": "structural-scheme",
   "private": true,
-  "description": "Генератор структурных схем АСУ ТП (статическая страница без сборки)",
+  "description": "Генератор структурных схем АСУ ТП (один HTML-файл без сборки в браузере)",
   "license": "CC0-1.0",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
+    "build": "node scripts/build.js",
     "test": "node --test tests/*.test.js",
     "build:css": "tailwindcss -c tailwind.config.js -i src/tailwind.css -o src/styles.css --minify",
     "vendor": "node scripts/vendor.js",

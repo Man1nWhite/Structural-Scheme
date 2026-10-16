@@ -44,8 +44,14 @@ test('повторяющиеся и зарезервированные id зам
 
 test('числа можно хранить строкой (значение поля ввода)', () => {
   const state = core.normalizeState({ project: { blocksPerRow: '3' }, racks: [{ servers: Infinity }] });
-  assert.equal(state.project.blocksPerRow, '3');
+  assert.equal(state.project.blocksPerRow, '3', 'строка из поля ввода остаётся строкой');
   assert.equal(state.racks[0].servers, core.ITEM_DEFAULTS.racks.servers);
+});
+
+test('число блоков в ряду приводится к допустимому диапазону при загрузке', () => {
+  assert.equal(core.normalizeState({ project: { blocksPerRow: 99 } }).project.blocksPerRow, core.PER_ROW_MAX);
+  assert.equal(core.normalizeState({ project: { blocksPerRow: 0 } }).project.blocksPerRow, 1);
+  assert.equal(core.normalizeState({ project: { blocksPerRow: 'много' } }).project.blocksPerRow, 1);
 });
 
 test('чужие и повреждённые файлы отклоняются понятной ошибкой', () => {
