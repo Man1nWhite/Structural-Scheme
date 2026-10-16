@@ -37,4 +37,89 @@ function sampleState(overrides = {}) {
   return { ...state, ...overrides };
 }
 
-module.exports = { ROOT, core, parseXml, sampleState, read: (p) => fs.readFileSync(path.join(ROOT, p), 'utf8') };
+// ---------- Геометрические инварианты схемы ----------
+// Используются тестами трассировки: схема читается как чертёж, и по ней проверяется,
+// что линии не сливаются, не проходят сквозь блоки и не выходят за лист.
+
+const span = (a1, a2, b1, b2) => Math.min(Math.max(a1, a2), Math.max(b1, b2))
+  - Math.max(Math.min(a1, a2), Math.min(b1, b2));
+
+// Отрезки всех связей модели.
+function segmentsOf(model) {
+  const out = [];
+  model.conns.forEach(c => {
+    for (let k = 0; k + 1 < c.pts.length; k++) {
+      const [x1, y1] = c.pts[k], [x2, y2] = c.pts[k + 1];
+      out.push({ c, k, x1, y1, x2, y2, horizontal: Math.abs(y1 - y2) < 0.01, length: Math.hypot(x2 - x1, y2 - y1) });
+    }
+  });
+  return out;
+}
+
+// Прямоугольник и отрезок пересекаются (по внутренней части, без касания граней).
+function hitsRect(s, r, pad = 0.5) {
+  const x1 = Math.min(s.x1, s.x2), x2 = Math.max(s.x1, s.x2);
+  const y1 = Math.min(s.y1, s.y2), y2 = Math.max(s.y1, s.y2);
+  return x1 < r.x + r.w - pad && x2 > r.x + pad && y1 < r.y + r.h - pad && y2 > r.y + pad;
+}
+
+// Все замечания к чертежу: пустой список — схема нарисована корректно.
+function layoutProblems(model) {
+  const problems = [];
+  const name = c => `${c.src.id}→${c.tgt.id}`;
+  const segs = segmentsOf(model);
+
+  segs.forEach(s => {
+    if (s.length < 0.01) problems.push(`связь ${name(s.c)}: пустой отрезок`);
+    else if (!s.horizontal && Math.abs(s.x1 - s.x2) > 0.01) problems.push(`связь ${name(s.c)}: отрезок не горизонтален и не вертикален`);
+  });
+
+  for (let a = 0; a < segs.length; a++) {
+    for (let b = a + 1; b < segs.length; b++) {
+      const A = segs[a], B = segs[b];
+      if (A.c === B.c || A.horizontal !== B.horizontal || A.length < 0.01 || B.length < 0.01) continue;
+      const len = A.horizontal
+        ? (Math.abs(A.y1 - B.y1) < 0.05 ? span(A.x1, A.x2, B.x1, B.x2) : 0)
+        : (Math.abs(A.x1 - B.x1) < 0.05 ? span(A.y1, A.y2, B.y1, B.y2) : 0);
+      if (len > 1.5) {
+        problems.push(`связи ${name(A.c)} и ${name(B.c)} идут по одной линии (${A.horizontal ? 'y' : 'x'}=${(A.horizontal ? A.y1 : A.x1).toFixed(1)}, ${len.toFixed(1)} px)`);
+      }
+    }
+  }
+
+  model.conns.forEach(c => {
+    segs.filter(s => s.c === c).forEach(s => {
+      model.blocks.forEach(b => {
+        if (b === c.src || b === c.tgt) return;
+        if (hitsRect(s, b)) problems.push(`связь ${name(c)} проходит сквозь блок ${b.id}`);
+      });
+    });
+  });
+
+  model.signals.forEach(s => {
+    const seg = { x1: s.x, x2: s.x, y1: s.y1, y2: s.y2 };
+    model.blocks.forEach(b => {
+      if (b === s.block || b.y < s.block.y) return;
+      if (hitsRect(seg, b)) problems.push(`стрелка ${s.kind} под блоком ${s.block.id} проходит сквозь блок ${b.id}`);
+    });
+  });
+
+  model.ext.forEach(e => {
+    if (e.x2 > model.width) problems.push(`внешняя связь блока ${e.b.id} выходит за лист`);
+    const seg = { x1: e.x1, x2: e.x2, y1: e.y, y2: e.y };
+    model.blocks.forEach(b => { if (b !== e.b && hitsRect(seg, b, 0)) problems.push(`внешняя связь проходит сквозь блок ${b.id}`); });
+  });
+
+  model.legend.items.forEach(it => {
+    if (it.x + 100 > model.legend.x + model.legend.w) problems.push(`элемент легенды «${it.name}» выходит за рамку`);
+  });
+  if (model.legend.y + model.legend.h > model.height) problems.push('легенда выходит за лист');
+  if (model.notes && model.notes.y + 20 + model.notes.lines.length * 16 > model.height) problems.push('примечания выходят за лист');
+
+  return problems;
+}
+
+module.exports = {
+  ROOT, core, parseXml, sampleState, layoutProblems, segmentsOf,
+  read: (p) => fs.readFileSync(path.join(ROOT, p), 'utf8'),
+};

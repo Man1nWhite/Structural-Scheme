@@ -1,25 +1,16 @@
-// Сквозные тесты интерфейса: настоящий index.html в jsdom со всеми скриптами.
-// React подменяется development-сборкой той же версии, чтобы ловить предупреждения.
+// Сквозные тесты интерфейса: собираем настоящую страницу (scripts/build.js) и
+// запускаем её в jsdom. React подменяется development-сборкой, чтобы ловить
+// предупреждения, — для этого у сборки есть режим dev.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
-const { JSDOM, ResourceLoader, VirtualConsole } = require('jsdom');
+const { JSDOM, VirtualConsole } = require('jsdom');
 const { ROOT, core } = require('./helpers');
+const { build } = require('../scripts/build');
 
 const ORIGIN = 'http://scheme.test/';
-const DEV_BUILDS = {
-  'vendor/react.production.min.js': 'node_modules/react/umd/react.development.js',
-  'vendor/react-dom.production.min.js': 'node_modules/react-dom/umd/react-dom.development.js',
-};
-
-class LocalLoader extends ResourceLoader {
-  fetch(url) {
-    const rel = decodeURIComponent(new URL(url).pathname.slice(1));
-    const file = path.join(ROOT, DEV_BUILDS[rel] || rel);
-    return Promise.resolve(fs.readFileSync(file));
-  }
-}
+const PAGE = build({ dev: true });
 
 async function openApp({ storage } = {}) {
   const errors = [];
@@ -30,8 +21,8 @@ async function openApp({ storage } = {}) {
 
   const downloads = [];
   const dialogs = { confirm: true, alerts: [] };
-  const dom = new JSDOM(fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8'), {
-    url: ORIGIN, runScripts: 'dangerously', resources: new LocalLoader(), virtualConsole, pretendToBeVisual: true,
+  const dom = new JSDOM(PAGE, {
+    url: ORIGIN, runScripts: 'dangerously', virtualConsole, pretendToBeVisual: true,
     beforeParse(w) {
       if (storage) Object.entries(storage).forEach(([k, v]) => w.localStorage.setItem(k, v));
       w.URL.createObjectURL = blob => { downloads.push({ blob }); return 'blob:' + downloads.length; };

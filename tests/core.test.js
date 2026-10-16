@@ -68,3 +68,22 @@ test('фабрики новых элементов ссылаются на пе�
   assert.equal(core.newNetCab(state).name, 'Шкаф сетевой ШС-02');
   assert.notEqual(core.newRack(state).id, core.newRack(state).id);
 });
+
+test('clampPerRow держит число блоков в ряду в разумных пределах', () => {
+  assert.equal(core.clampPerRow(3), 3);
+  assert.equal(core.clampPerRow('12'), 12);
+  assert.equal(core.clampPerRow(2.7), 2, 'дробное значение округляется вниз');
+  assert.equal(core.clampPerRow(0), 1);
+  assert.equal(core.clampPerRow(-5), 1);
+  assert.equal(core.clampPerRow(''), 1);
+  assert.equal(core.clampPerRow('abc'), 1);
+  assert.equal(core.clampPerRow(1e6), core.PER_ROW_MAX, 'иначе лист растягивается на десятки тысяч пикселей');
+});
+
+test('rasterScale укладывает картинку в предел canvas и не мельчит её', () => {
+  assert.equal(core.rasterScale(1000, 800), core.RASTER_SCALE, 'обычный лист печатается в двойном размере');
+  const big = core.rasterScale(6000, 3000);
+  assert.ok(big > 0 && big < core.RASTER_SCALE, 'для большого листа масштаб уменьшается');
+  assert.ok(6000 * big * 3000 * big <= core.RASTER_MAX_PIXELS + 1, 'площадь картинки не больше предела');
+  assert.ok(core.rasterScale(1e6, 1e6) > 0, 'огромный лист всё равно даёт положительный масштаб');
+});

@@ -85,16 +85,23 @@
     const fname = model.fileName;
     const exportSvg = () => download(new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }), fname + '.svg');
     const exportRaster = (type) => {
+      const ext = type === 'image/jpeg' ? '.jpg' : '.png';
+      const fail = (why) => alert('Не удалось сохранить ' + ext.slice(1).toUpperCase() + ': ' + why + ' Попробуйте экспорт в SVG.');
       const img = new Image();
       img.onload = () => {
+        const scale = C.rasterScale(model.width, model.height);
         const c = document.createElement('canvas');
-        c.width = model.width * 2; c.height = model.height * 2;
+        c.width = Math.round(model.width * scale); c.height = Math.round(model.height * scale);
         const ctx = c.getContext('2d');
         ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, c.width, c.height);
         ctx.drawImage(img, 0, 0, c.width, c.height);
-        c.toBlob(b => download(b, fname + (type === 'image/jpeg' ? '.jpg' : '.png')), type, 0.95);
+        const done = (blob) => blob
+          ? download(blob, fname + ext)
+          : fail('браузер не справился с размером листа.');
+        try { c.toBlob(done, type, 0.95); }
+        catch (err) { fail(err.message + '.'); }
       };
-      img.onerror = () => alert('Не удалось растеризовать схему. Попробуйте экспорт в SVG.');
+      img.onerror = () => fail('браузер не смог разобрать схему.');
       img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
     };
     const exportDrawio = () => download(new Blob([C.toDrawio(model)], { type: 'application/xml' }), fname + '.drawio');
@@ -217,11 +224,14 @@
               <div className="col-span-4"><${Inp} value=${r.name} onChange=${e => updRack(r.id, 'name', e.target.value)} /></div>
               <div><${Num} value=${r.servers} onChange=${e => updRack(r.id, 'servers', Number(e.target.value))} /></div>
               <div className="col-span-3">${netSelect(effNet(r.netTarget), e => updRack(r.id, 'netTarget', e.target.value))}</div>
-              <div><${Chk} checked=${r.kvm} onChange=${e => updRack(r.id, 'kvm', e.target.checked)} /></div>
+              <div><${Chk} checked=${r.kvm} title="Стойка подключается к щиту КВМ-удлинителей (вкладка «Операторная»)"
+                onChange=${e => updRack(r.id, 'kvm', e.target.checked)} /></div>
               <div><${Chk} checked=${r.ntp} onChange=${e => updRack(r.id, 'ntp', e.target.checked)} /></div>
               <div><${Chk} checked=${r.ups} onChange=${e => updRack(r.id, 'ups', e.target.checked)} /></div>
               <${DelBtn} onClick=${() => del('racks')(r.id)} />
             </div>`)}
+          ${!project.kvmPanel && racks.some(r => r.kvm) && html`
+            <p className="text-xs text-amber-700 mt-1">Линия KVM от стойки строится только при включённом «Щите КВМ-удлинителей» — включите его на вкладке «Операторная».</p>`}
           <${AddBtn} onClick=${add('racks', C.newRack)}>Добавить стойку<//>
         </div>
         <div>
