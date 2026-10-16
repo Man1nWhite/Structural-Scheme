@@ -1,0 +1,7 @@
+# Единые LF-переносы во всех текстовых файлах.
+* text=auto eol=lf
+
+# Сторонние и сгенерированные файлы: не показывать построчный diff.
+vendor/** -diff linguist-vendored
+src/styles.css -diff linguist-generated
+package-lock.json linguist-generated

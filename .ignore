@@ -1,0 +1,4 @@
+# Исключения для ripgrep/fd: минифицированные и сгенерированные файлы.
+vendor/
+src/styles.css
+package-lock.json
