@@ -122,6 +122,48 @@ test('без щита КВМ линии в щит не строятся', () => 
   assert.equal(m.conns.find(c => c.src.id === 'op3').tgt.id, 'net1');
 });
 
+test('высота блока — по числу строк описания, без пустого низа', () => {
+  const m = core.buildScheme(sampleState());
+  const of = id => m.blocks.find(b => b.id === id);
+  assert.equal(of('net1').lines.length, 5, 'сетевой шкаф: 5 строк');
+  assert.equal(of('rack1').lines.length, 4);
+  assert.equal(of('a1').lines.length, 1);
+  assert.equal(of('net1').h - of('rack1').h, 16, 'на строку меньше — на шаг строки ниже');
+  assert.equal(of('net1').h - of('a1').h, 4 * 16, 'одна строка — самый низкий блок');
+
+  const short = core.buildScheme(core.createDefaultState());
+  const auto = short.blocks.filter(b => b.level === 'auto');
+  assert.ok(auto.every(b => b.h === auto[0].h), 'одинаковые описания — одинаковая высота');
+  assert.ok(auto[0].h < of('net1').h, 'шкаф с одной строкой ниже шкафа с пятью');
+
+  const sample = sampleState();
+  sample.racks[0].ntp = false;
+  const less = core.buildScheme(sample).blocks.find(b => b.id === 'rack1');
+  assert.equal(less.h, of('rack1').h - 16, 'выключили строку — блок стал ниже');
+});
+
+test('блоки АРМ на четверть уже остальных, но по центру своей колонки', () => {
+  const m = core.buildScheme(sampleState());
+  const op = m.blocks.filter(b => b.level === 'op' && b.kind === 'item');
+  const others = m.blocks.filter(b => b.kind === 'net' || b.kind === 'auto');
+  op.forEach(b => assert.equal(b.w, others[0].w * 0.75, 'ширина АРМ — 3/4 ширины шкафа'));
+
+  // Центры узких блоков лежат на общей сетке колонок: шаг берём по соседним АРМ,
+  // а широкий щит КВМ должен попасть на ту же сетку.
+  const colStep = op[1].x - op[0].x;
+  const colCenter = b => op[0].x + op[0].w / 2 + (b.col - op[0].col) * colStep;
+  op.forEach(b => {
+    assert.ok(Math.abs(b.x + b.w / 2 - colCenter(b)) < 0.01, `АРМ по центру колонки ${b.col}`);
+    assert.ok(b.nameText.length <= core.fit(b.name, 100).length, 'заголовок влезает по ширине');
+  });
+  const panel = m.blocks.find(b => b.kind === 'panel');
+  assert.equal(panel.w, others[0].w, 'щит КВМ обычной ширины');
+  assert.ok(Math.abs(panel.x + panel.w / 2 - colCenter(panel)) < 0.01, 'широкий блок на той же сетке');
+
+  const svg = core.toSvg(m);
+  op.forEach(b => assert.ok(svg.includes(`>${b.nameText}<`), `подпись ${b.nameText} есть в SVG`));
+});
+
 test('описания блоков', () => {
   const m = core.buildScheme(sampleState());
   const lines = id => m.blocks.find(b => b.id === id).lines;
