@@ -29,6 +29,10 @@
   const OP_TYPES = ['АРМ', 'Принтер', 'Панель управления'];
   const OP_LINKS = ['Витая пара', 'Оптика', 'KVM'];
   const AUTO_UPLINKS = ['Витая пара', 'Оптика'];
+  // Шкаф автоматики может не иметь связи сверху: он подключается только
+  // к другому шкафу по RS-485 (или вообще стоит отдельно).
+  const UPLINK_NONE = 'Без связи';
+  const AUTO_UPLINK_OPTIONS = [...AUTO_UPLINKS, UPLINK_NONE];
   const KVM_PANEL_ID = 'kvmpanel';
 
   // ---------- Утилиты ----------
@@ -61,6 +65,35 @@
     return s;
   };
   const fileNameOf = (project) => (project.fileName || 'scheme').replace(/[^\wа-яА-ЯёЁ-]+/g, '_');
+
+  // ---------- Концы связей шкаф-шкаф на нижней грани ----------
+  // По нижней грани шкафа равномерно стоят стрелки DI/DO/AI/AO/RS-485. Связь
+  // RS-485 между шкафами выходит из грани справа после всех стрелок, а входит
+  // слева до них: иначе вертикаль совпадает со стрелкой и читается как ещё
+  // один сигнал. Сами стрелки при этом не сдвигаются.
+  const CAB_EDGE_PAD = 10; // минимальный отступ конца связи от боковой грани блока
+  const cabEdge = (b) => {
+    const n = signalsOf(b.item).length;
+    return {
+      first: b.x + b.w / (n + 1),                    // первая стрелка
+      last: b.x + b.w * n / (n + 1),                 // последняя стрелка
+      hasSignals: n > 0,
+    };
+  };
+  // index — номер связи на своей стороне (0 — ближняя к стрелкам), count — сколько их.
+  function cabLinkX(b, side, index, count) {
+    const e = cabEdge(b);
+    const x0 = b.x, x1 = b.x + b.w;
+    if (!e.hasSignals) {                             // стрелок нет: делим всю грань
+      return x0 + (x1 - x0) * (index + 1) / (count + 1);
+    }
+    if (side === 'out') {
+      const free = (x1 - CAB_EDGE_PAD) - e.last;     // поле справа от стрелок
+      return e.last + free * (index + 1) / (count + 1);
+    }
+    const free = e.first - (x0 + CAB_EDGE_PAD);      // поле слева от стрелок
+    return e.first - free * (index + 1) / (count + 1);
+  }
 
   // ---------- Экспорт растровой картинки ----------
   // Браузеры отказываются растрировать слишком большой лист: canvas ограничен по
@@ -367,8 +400,11 @@
     });
     const rs485CabLinks = new Set();
     LV.auto.blocks.forEach(b => {
-      const t = blk[effNet(b.item.netTarget)];
-      if (t) conns.push({ src: b, tgt: t, color: COLORS[b.item.uplink] || COLORS['Витая пара'] });
+      // «Без связи» — шкаф не подключается к сети, только к другому шкафу.
+      if (b.item.uplink !== UPLINK_NONE) {
+        const t = blk[effNet(b.item.netTarget)];
+        if (t) conns.push({ src: b, tgt: t, color: COLORS[b.item.uplink] || COLORS['Витая пара'] });
+      }
 
       if (b.item.rs485Cab) {
         const targetId = effAutoTarget(b.item.rs485Target, b.id);
@@ -376,7 +412,7 @@
         const linkKey = target ? [b.id, target.id].sort().join('|') : null;
         if (target && !rs485CabLinks.has(linkKey)) {
           rs485CabLinks.add(linkKey);
-          conns.push({ src: b, tgt: target, color: COLORS['RS-485'] });
+          conns.push({ src: b, tgt: target, color: COLORS['RS-485'], cabLink: true });
         }
       }
     });
@@ -403,6 +439,13 @@
     groupBy(conns, c => c.src.id + '|' + c.sEdge).forEach(g => {
       g.sort((a, b) => cx(a.tgt) - cx(b.tgt));
       g.forEach((c, i) => { c.sx = cx(c.src) + (i - (g.length - 1) / 2) * EXIT_STEP; });
+    });
+    // RS-485 между шкафами выходит из нижней грани справа после всех стрелок
+    // сигналов (см. cabLinkX), а не по центру блока.
+    LV.auto.blocks.forEach(b => {
+      const outs = conns.filter(c => c.cabLink && c.src === b && c.sEdge === 'bottom')
+        .sort((a, b2) => cx(a.tgt) - cx(b2.tgt));
+      outs.forEach((c, i) => { c.sx = cabLinkX(b, 'out', i, outs.length); });
     });
 
     // ---- подход от грани блока к полосе: прямой либо через межколоночный зазор ----
@@ -449,6 +492,13 @@
         return ka === 1 ? proxyOf(a.sApp) - proxyOf(b.sApp) : b.sx - a.sx;
       });
       g.forEach((c, j) => { c.tx = T.x + T.w * (j + 1) / (g.length + 1); });
+    });
+    // Вход RS-485 между шкафами в нижнюю грань — слева от стрелок, по порядку
+    // источников, чтобы линии не пересекались у грани.
+    LV.auto.blocks.forEach(b => {
+      const ins = conns.filter(c => c.cabLink && c.tgt === b && c.tEdge === 'bottom')
+        .sort((a, b2) => proxyOf(a.sApp) - proxyOf(b2.sApp));
+      ins.forEach((c, i) => { c.tx = cabLinkX(b, 'in', i, ins.length); });
     });
     conns.forEach(c => { c.tApp = approach(c, false, proxyOf(c.sApp)); });
     assignSlots();
@@ -789,7 +839,7 @@
   }
 
   return {
-    COLORS, NAME_BY_COLOR, OP_TYPES, OP_LINKS, AUTO_UPLINKS, KVM_PANEL_ID,
+    COLORS, NAME_BY_COLOR, OP_TYPES, OP_LINKS, AUTO_UPLINKS, AUTO_UPLINK_OPTIONS, UPLINK_NONE, KVM_PANEL_ID,
     PROJECT_DEFAULTS, ITEM_DEFAULTS, FORMAT, FORMAT_VERSION, STORAGE_KEY,
     PER_ROW_MAX, RASTER_SCALE, RASTER_MAX_PIXELS,
     uid, fit, pad2, clampPerRow, rasterScale, signalLabel, signalsOf, fileNameOf, routeBand,

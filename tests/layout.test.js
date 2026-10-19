@@ -80,6 +80,39 @@ test('RS-485 между шкафами появляется только при 
   assert.ok(!m.conns.some(c => c.src.level === 'auto' && c.tgt.level === 'auto'));
 });
 
+test('«Без связи» убирает верхнюю линию шкафа, но не связь с другим шкафом', () => {
+  const state = sampleState();
+  state.autoCabs = state.autoCabs.map(c => ({ ...c, uplink: core.UPLINK_NONE }));
+  const m = core.buildScheme(state);
+  const auto = m.conns.filter(c => c.src.level === 'auto');
+  assert.deepEqual(auto.map(connName), ['a1→a2'], 'осталась только линия RS-485 между шкафами');
+
+  // Значение переживает сохранение и загрузку.
+  const loaded = core.parseState(core.serializeState(state));
+  assert.equal(loaded.autoCabs[0].uplink, core.UPLINK_NONE);
+  assert.ok(!core.buildScheme(loaded).conns.some(c => c.src.level === 'auto' && c.tgt.level !== 'auto'));
+});
+
+test('RS-485 между шкафами выходит справа после стрелок, а входит слева до них', () => {
+  const m = core.buildScheme(sampleState());
+  const conn = m.conns.find(c => c.src.id === 'a1' && c.tgt.id === 'a2');
+  assert.ok(conn, 'связь a1 → a2 есть');
+  const sigX = id => m.signals.filter(s => s.block.id === id).map(s => s.x).sort((a, b) => a - b);
+  const a1 = m.blocks.find(b => b.id === 'a1'), a2 = m.blocks.find(b => b.id === 'a2');
+  const [sx, sy] = conn.pts[0];
+  const [tx, ty] = conn.pts[conn.pts.length - 1];
+
+  assert.equal(sy, a1.y + a1.h, 'выход из нижней грани');
+  assert.equal(ty, a2.y + a2.h, 'вход в нижнюю грань');
+  assert.ok(sx > Math.max(...sigX('a1')) + 5, 'выход правее всех стрелок DI/DO/AI/AO/RS-485');
+  assert.ok(sx > a1.x + a1.w * 0.8, 'выход у правого края, а не по центру');
+  assert.ok(tx < Math.min(...sigX('a2')) - 5, 'вход левее всех стрелок');
+  assert.ok(tx < a2.x + a2.w * 0.3, 'вход у левого края');
+  sigX('a1').concat(sigX('a2')).forEach(x => {
+    assert.ok(Math.abs(sx - x) > 5 && Math.abs(tx - x) > 5, 'вертикаль не совпадает со стрелкой сигнала');
+  });
+});
+
 test('без щита КВМ линии в щит не строятся', () => {
   const state = sampleState();
   state.project.kvmPanel = false;

@@ -111,6 +111,28 @@ test('повреждённое сохранение не мешает запус
   app.w.close();
 });
 
+test('«Без связи» выключает верхнюю линию шкафа автоматики', async () => {
+  const app = await openApp();
+  await app.tab('Шкафы автоматики');
+  const row = () => app.$$('.overflow-x-auto > .flex.items-start')[0];
+  const selects = () => row().querySelectorAll('select');
+  const paths = () => app.$$('[data-testid="preview"] svg path').length;
+  const before = paths();
+  assert.equal(selects().length, 2, 'связь сверху и куда');
+  assert.ok([...selects()[0].options].some(o => o.textContent === 'Без связи'), 'опция есть в списке');
+
+  await app.select(selects()[0], core.UPLINK_NONE);
+  assert.equal(app.stored().autoCabs[0].uplink, core.UPLINK_NONE);
+  assert.equal(paths(), before - 1, 'линия к сетевому шкафу пропала');
+  assert.equal(selects().length, 1, 'поле «Куда» скрыто: связи сверху нет');
+
+  await app.select(selects()[0], 'Витая пара');
+  assert.equal(app.stored().autoCabs[0].uplink, 'Витая пара');
+  assert.equal(paths(), before, 'линия вернулась');
+  assert.deepEqual(app.errors, []);
+  app.w.close();
+});
+
 test('RS-485 между шкафами включается из интерфейса', async () => {
   const app = await openApp();
   await app.tab('Шкафы автоматики');
