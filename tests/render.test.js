@@ -31,7 +31,9 @@ test('SVG содержит блоки, линии, сигналы и леген�
   const doc = parseXml(core.toSvg(m));
   assert.equal(doc.getElementsByTagName('path').length, m.conns.length);
   const texts = [...doc.getElementsByTagName('text')].map(t => t.textContent);
-  m.blocks.forEach(b => assert.ok(texts.includes(core.fit(b.name, 28)), `есть подпись блока ${b.id}`));
+  // Подпись обрезается по ширине блока: у узкого АРМ символов помещается меньше.
+  m.blocks.forEach(b => assert.ok(texts.includes(b.nameText), `есть подпись блока ${b.id}`));
+  m.blocks.forEach(b => assert.ok(b.nameText.length * 6.4 <= b.w - 8, `подпись ${b.nameText} влезает в блок ${b.id}`));
   m.signals.forEach(s => assert.ok(texts.includes(s.label), `есть подпись сигнала ${s.label}`));
   assert.ok(texts.includes('Условные обозначения:'));
   const extLines = [...doc.getElementsByTagName('line')].filter(l => l.getAttribute('stroke-dasharray') === '7 4');

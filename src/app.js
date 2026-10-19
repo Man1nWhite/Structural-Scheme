@@ -270,9 +270,13 @@
             <div className="w-40 shrink-0"><${Inp} value=${c.name} onChange=${e => updAuto(c.id, 'name', e.target.value)} /></div>
             <div className="w-16 shrink-0"><${Num} value=${c.ctrls} onChange=${e => updAuto(c.id, 'ctrls', Number(e.target.value))} /></div>
             <div className="w-28 shrink-0">
-              <${Sel} value=${c.uplink} onChange=${e => updAuto(c.id, 'uplink', e.target.value)}>${options(C.AUTO_UPLINKS)}<//>
+              <${Sel} value=${c.uplink} onChange=${e => updAuto(c.id, 'uplink', e.target.value)}>${options(C.AUTO_UPLINK_OPTIONS)}<//>
             </div>
-            <div className="w-44 shrink-0">${netSelect(effNet(c.netTarget), e => updAuto(c.id, 'netTarget', e.target.value))}</div>
+            <div className="w-44 shrink-0">
+              ${c.uplink === C.UPLINK_NONE
+                ? html`<${Dash} />`
+                : netSelect(effNet(c.netTarget), e => updAuto(c.id, 'netTarget', e.target.value))}
+            </div>
             ${SIGNAL_FIELDS.map(([f, nf]) => html`
               <div key=${f} className="w-8 shrink-0 flex flex-col items-start gap-1 pt-1">
                 <${Chk} checked=${c[f]} onChange=${e => updAuto(c.id, f, e.target.checked)} />

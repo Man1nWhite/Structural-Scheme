@@ -47,6 +47,25 @@ test('демо-проект и проект с множеством блоков
   check(loadedState(), 'загруженный проект');
 });
 
+test('девять шкафов автоматики в три ряда со связями шкаф-шкаф — без замечаний', () => {
+  // Раскладка из примера пользователя: девять шкафов в три ряда, часть без
+  // связи сверху, часть связана с соседями по RS-485.
+  const state = core.createDefaultState();
+  state.project.blocksPerRow = 4;
+  state.autoCabs = Array.from({ length: 9 }, (_, i) => ({
+    ...core.ITEM_DEFAULTS.autoCabs, id: 'a' + i, name: 'ША-0' + (i + 1), ctrls: 1,
+    uplink: i === 7 ? core.UPLINK_NONE : 'Витая пара',
+    netTarget: state.netCabs[0].id,
+    rs485: i < 5, di: true, dO: true, ai: true, ao: i < 3,
+    rs485Cab: i % 2 === 0, rs485Target: 'a' + (i + 1),
+  }));
+  const model = check(state, '9 шкафов в 3 ряда');
+  assert.equal(new Set(model.blocks.filter(b => b.level === 'auto').map(b => b.y)).size, 3);
+  assert.ok(!model.conns.some(c => c.src.id === 'a7' && c.tgt.level !== 'auto'), 'у ША-08 нет верхней линии');
+  assert.equal(model.conns.filter(c => c.src.level === 'auto' && c.tgt.level === 'auto').length, 5,
+    'связи RS-485 между шкафами построены');
+});
+
 test('пустой проект и проект без серверной части рисуются без замечаний', () => {
   check({ project: { ...core.PROJECT_DEFAULTS }, opItems: [], racks: [], netCabs: [], autoCabs: [] }, 'пустой проект');
   const withoutServer = core.createDefaultState();
@@ -92,7 +111,8 @@ function makeRandom(seed = 7) {
     }));
     state.autoCabs = Array.from({ length: int(1, 8) }, (_, i) => ({
       ...core.ITEM_DEFAULTS.autoCabs, id: 'a' + i, name: 'ША-' + i, ctrls: int(0, 3),
-      uplink: pick(core.AUTO_UPLINKS), di: rnd() < 0.8, dO: rnd() < 0.8, ai: rnd() < 0.8,
+      uplink: rnd() < 0.15 ? core.UPLINK_NONE : pick(core.AUTO_UPLINKS),
+      di: rnd() < 0.8, dO: rnd() < 0.8, ai: rnd() < 0.8,
       ao: rnd() < 0.5, rs485: rnd() < 0.6, rs485Cab: rnd() < 0.5,
     }));
     // Ссылки в том числе на удалённые элементы: их разрешают makeResolvers.
