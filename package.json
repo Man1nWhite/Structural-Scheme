@@ -4,7 +4,10 @@
   "description": "Генератор структурных схем АСУ ТП (один HTML-файл без сборки в браузере)",
   "license": "CC0-1.0",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
+  },
+  "overrides": {
+    "postcss-selector-parser": "^6.1.5"
   },
   "scripts": {
     "build": "node scripts/build.js",

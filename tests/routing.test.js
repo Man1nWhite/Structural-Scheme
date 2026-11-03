@@ -1,7 +1,6 @@
-// Трассировка линий: схема — это чертёж, поэтому проверяются свойства чертежа,
-// а не координаты. Раньше вертикали разных связей ложились в одну линию, встречались
-// пустые отрезки и линии, проходящие сквозь блоки: набор проектов ниже ловит возврат
-// этих ошибок (см. src/core.js, распределение мест вертикалей — seat()).
+// Трассировка линий: схема — это чертёж, поэтому проверяются свойства чертежа, а не
+// координаты: линии не сливаются, не проходят сквозь блоки, нет пустых отрезков.
+// Не ослабляйте эти проверки (см. README, «Построение линий»).
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { core, layoutProblems, sampleState } = require('./helpers');
@@ -148,4 +147,40 @@ test('связи не выходят за лист и остаются орто�
       });
     });
   }
+});
+
+test('совпавшие внутренние обходы разносятся без сдвига концов связей', () => {
+  const next = makeRandom(7);
+  let state;
+  for (let i = 0; i <= 38; i++) state = next();
+  const model = check(state, 'проект с повторным использованием обхода');
+  const cab = model.blocks.find(b => b.id === 'a1');
+  const conn = model.conns.find(c => c.src.id === 'a1' && c.tgt.id === 'n0');
+  assert.ok(conn.sApp.run, 'вертикаль обхода не является концом связи');
+  assert.notEqual(conn.pts[0][0], conn.sApp.run.ax);
+  assert.ok(conn.pts[0][0] > cab.x && conn.pts[0][0] < cab.x + cab.w);
+});
+
+test('отвод RS-485 не сдвигает закреплённый конец на шкафу', () => {
+  const next = makeRandom(11);
+  let state;
+  for (let i = 0; i <= 26; i++) state = next();
+  const model = check(state, 'проект с отводом RS-485');
+  model.conns.filter(c => c.cabLink).forEach(c => {
+    const [sx, sy] = c.pts[0], [tx, ty] = c.pts[c.pts.length - 1];
+    assert.ok(sy === c.src.y || sy === c.src.y + c.src.h);
+    assert.ok(ty === c.tgt.y || ty === c.tgt.y + c.tgt.h);
+    assert.ok(sx > c.src.x && sx < c.src.x + c.src.w);
+    assert.ok(tx > c.tgt.x && tx < c.tgt.x + c.tgt.w);
+    if (c.sEdge === 'bottom') assert.equal(sx, core.cabLinkX(c.src, 'out', 0, 1));
+    if (c.tEdge === 'bottom') assert.equal(tx, core.cabLinkX(c.tgt, 'in', 0, 1));
+  });
+  assert.ok(model.conns.some(c => c.cabLink && (c.sApp.edge || c.tApp.edge)), 'короткий отвод действительно построен');
+});
+
+test('повторная сборка одного проекта даёт одинаковую геометрию', () => {
+  const state = loadedState();
+  state.project.blocksPerRow = 1;
+  const points = () => core.buildScheme(state).conns.map(c => c.pts);
+  assert.deepEqual(points(), points());
 });

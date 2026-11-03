@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { core, parseXml, sampleState } = require('./helpers');
+const { core, parseXml, sampleState, layoutProblems } = require('./helpers');
 
 const tricky = () => {
   const state = sampleState();
@@ -84,5 +84,101 @@ test('связи Draw.io идут по тем же точкам, что и в SV
     const pts = [...e.getElementsByTagName('mxPoint')].map(p => [Number(p.getAttribute('x')), Number(p.getAttribute('y'))]);
     const expected = m.conns[i].pts.slice(1, -1).map(([x, y]) => [Math.round(x), Math.round(y)]);
     assert.deepEqual(pts, expected);
+  });
+});
+
+test('Draw.io остаётся корректным XML при необычных id из чужого файла', () => {
+  const odd = 'n"1 <&>';
+  const state = core.parseState(JSON.stringify({
+    netCabs: [{ id: odd, name: 'ШС', external: true }],
+    autoCabs: [{ id: 'a1', name: 'ША', netTarget: odd, di: true, rs485: true }],
+  }));
+  const model = core.buildScheme(state);
+  const cells = [...parseXml(core.toDrawio(model)).getElementsByTagName('mxCell')];
+  assert.ok(cells.some(c => c.getAttribute('id') === 'b_' + odd));
+  assert.ok(cells.some(c => c.getAttribute('target') === 'b_' + odd));
+  assert.ok(cells.some(c => c.getAttribute('source') === 'b_a1' && !c.hasAttribute('target')), 'id шкафа экранирован в источнике сигнала');
+  assert.ok(cells.some(c => c.getAttribute('source') === 'b_' + odd && !c.hasAttribute('target')), 'id экранирован в источнике внешней связи');
+  const ids = new Set(cells.map(c => c.getAttribute('id')));
+  cells.filter(c => c.getAttribute('edge') === '1').forEach(c => {
+    assert.ok(ids.has(c.getAttribute('source')));
+    if (c.hasAttribute('target')) assert.ok(ids.has(c.getAttribute('target')));
+  });
+});
+
+test('Draw.io экранирует id внешней связи и идентификаторы, похожие на свойства объекта', () => {
+  const state = core.normalizeState({ netCabs: [{ id: '__proto__', external: true }] });
+  const model = core.buildScheme(state);
+  assert.equal(model.conns.length, 0);
+  const cells = [...parseXml(core.toDrawio(model)).getElementsByTagName('mxCell')];
+  assert.ok(cells.some(c => c.getAttribute('id') === 'b___proto__'));
+  assert.ok(cells.some(c => c.getAttribute('source') === 'b___proto__' && !c.hasAttribute('target')));
+});
+
+test('белая обводка сохраняет подпись сигнала поверх линии в обоих форматах', () => {
+  const model = core.buildScheme(sampleState());
+  const svg = parseXml(core.toSvg(model));
+  const labels = [...svg.getElementsByTagName('g')].filter(g => g.querySelector('line') && g.querySelector('polygon') && g.querySelector('text')).map(g => g.querySelector('text'));
+  assert.deepEqual(labels.map(t => t.textContent), model.signals.map(s => s.label));
+  assert.equal(labels.length, model.signals.length);
+  labels.forEach(t => {
+    assert.equal(t.getAttribute('stroke'), '#ffffff');
+    assert.equal(t.getAttribute('stroke-width'), '3');
+    assert.equal(t.getAttribute('paint-order'), 'stroke');
+  });
+  const cells = [...parseXml(core.toDrawio(model)).getElementsByTagName('mxCell')];
+  model.signals.forEach(s => {
+    const cell = cells.find(c => c.getAttribute('edge') === '1' && c.getAttribute('value') === s.label);
+    assert.ok(cell.getAttribute('style').includes('labelBackgroundColor=#ffffff;'));
+  });
+});
+
+test('длинные заголовок, подзаголовок и примечания переносятся в общей модели', () => {
+  const state = sampleState();
+  state.project.title = 'Очень длинный заголовок структурной схемы промышленного комплекса '.repeat(5);
+  state.project.subtitle = 'Подзаголовок с подробным описанием объекта и назначением схемы '.repeat(4);
+  state.project.notesText = 'Длинное примечание с описанием требований к монтажу оборудования. '.repeat(8) + '\n' + 'я'.repeat(500);
+  const model = core.buildScheme(state);
+  assert.ok(model.titleLines.length > 1);
+  assert.ok(model.subtitleLines.length > 1);
+  assert.ok(model.notes.lines.length > 3);
+  assert.deepEqual(layoutProblems(model), []);
+  model.titleLines.forEach(line => assert.ok(line.length * 10.8 <= model.width - 36));
+  model.subtitleLines.forEach(line => assert.ok(line.length * 7.2 <= model.width - 36));
+  model.notes.lines.forEach(line => assert.ok(line.length * 6 <= model.notes.w));
+  const svg = parseXml(core.toSvg(model));
+  const texts = [...svg.getElementsByTagName('text')].map(t => t.textContent);
+  const drawio = [...parseXml(core.toDrawio(model)).getElementsByTagName('mxCell')].map(c => c.getAttribute('value'));
+  for (const line of [...model.titleLines, ...model.subtitleLines, ...model.notes.lines]) {
+    assert.ok(texts.includes(line), 'строка есть в SVG');
+    assert.ok(drawio.some(value => value && value.includes(line.replace(/&/g, '&amp;').replace(/</g, '&lt;'))), 'строка есть в Draw.io');
+  }
+  assert.ok(model.rooms[0].y > 150, 'помещения начинаются под увеличенным заголовком');
+});
+
+
+test('ширина примечаний Draw.io совпадает с моделью и не зависит от узкой легенды', () => {
+  const state = sampleState();
+  state.project.blocksPerRow = 12;
+  state.opItems = Array.from({ length: 12 }, (_, i) => ({ ...state.opItems[0], id: 'op-' + i }));
+  state.project.showNotes = true;
+  state.project.notesText = ('Подробное примечание к монтажу оборудования и связи. ').repeat(100);
+  const model = core.buildScheme(state);
+  // Модель допускает отдельную ширину легенды; проверяем экспорт при узкой легенде,
+  // даже если текущая раскладка по умолчанию растягивает её на всю ширину.
+  model.legend = { ...model.legend, w: 240 };
+  assert.ok(model.notes.w > model.legend.w, 'лист и примечания шире легенды');
+  assert.ok(model.notes.lines.length > 1);
+  assert.ok(model.notes.lines.some(line => line.length * 6 > model.legend.w), 'строка не помещается в легенду');
+  const svg = parseXml(core.toSvg(model));
+  const svgLines = [...svg.getElementsByTagName('text')].map(t => t.textContent);
+  const drawio = parseXml(core.toDrawio(model));
+  const cell = [...drawio.getElementsByTagName('mxCell')].find(c => c.getAttribute('id') === 'notes');
+  assert.ok(cell);
+  assert.equal(Number(cell.getElementsByTagName('mxGeometry')[0].getAttribute('width')), Math.round(model.notes.w));
+  const content = cell.getAttribute('value');
+  model.notes.lines.forEach(line => {
+    assert.ok(svgLines.includes(line), 'строка есть в SVG');
+    assert.ok(content.includes(`<div>${line}</div>`), 'та же строка есть в Draw.io');
   });
 });

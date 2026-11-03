@@ -12,7 +12,7 @@ const { build } = require('../scripts/build');
 const ORIGIN = 'http://scheme.test/';
 const PAGE = build({ dev: true });
 
-async function openApp({ storage } = {}) {
+async function openApp({ storage, prepare } = {}) {
   const errors = [];
   const virtualConsole = new VirtualConsole();
   virtualConsole.on('error', (...a) => errors.push(a.join(' ')));
@@ -30,6 +30,7 @@ async function openApp({ storage } = {}) {
       w.HTMLAnchorElement.prototype.click = function () { downloads[downloads.length - 1].name = this.download; };
       w.confirm = () => dialogs.confirm;
       w.alert = msg => dialogs.alerts.push(msg);
+      if (prepare) prepare(w);
     },
   });
   const w = dom.window;
@@ -47,7 +48,7 @@ async function openApp({ storage } = {}) {
     field: label => {
       const l = [...w.document.querySelectorAll('label')].find(x => x.textContent.trim() === label);
       assert.ok(l, `поле «${label}» существует`);
-      return l.parentElement.querySelector('input, textarea');
+      return l.querySelector('input, textarea') || l.parentElement.querySelector('input, textarea');
     },
     async click(el) { el.click(); await settle(); },
     async type(el, value) {
@@ -215,6 +216,145 @@ test('все вкладки открываются без ошибок', async (
   await app.tab('Серверная');
   await app.click(app.button('＋ Добавить сетевой шкаф'));
   assert.ok(app.svgTexts().includes('Шкаф сетевой ШС-02'));
+  assert.deepEqual(app.errors, []);
+  app.w.close();
+});
+
+test('нечитаемое сохранение не затирается: копия отложена, есть предупреждение', async () => {
+  const app = await openApp({ storage: { [core.STORAGE_KEY]: '{oops' } });
+  assert.equal(app.w.localStorage.getItem(core.STORAGE_BACKUP_KEY), '{oops');
+  assert.ok(app.$('[data-testid="storage-notice"]'));
+  await app.click(app.button('Скачать копию'));
+  assert.equal(await app.readBlob(app.downloads[0].blob), '{oops');
+  await app.click(app.button('Скрыть'));
+  assert.equal(app.$('[data-testid="storage-notice"]'), null);
+  assert.equal(app.w.localStorage.getItem(core.STORAGE_BACKUP_KEY), '{oops');
+  app.w.close();
+});
+
+test('проект более новой версии сохраняет исходный текст, а не только разобранные поля', async () => {
+  const saved = JSON.stringify({ format: core.FORMAT, version: core.FORMAT_VERSION + 1, futureData: [1, 2, 3] });
+  const app = await openApp({ storage: { [core.STORAGE_KEY]: saved } });
+  assert.equal(app.w.localStorage.getItem(core.STORAGE_BACKUP_KEY), saved);
+  assert.match(app.$('[data-testid="storage-notice"]').textContent, /более новом формате/);
+  await app.click(app.button('Скачать копию'));
+  assert.equal(await app.readBlob(app.downloads[0].blob), saved);
+  app.w.close();
+});
+
+test('при нехватке места копию нечитаемого проекта всё ещё можно скачать', async () => {
+  const app = await openApp({
+    storage: { [core.STORAGE_KEY]: '{oops' },
+    prepare(w) {
+      const setItem = w.Storage.prototype.setItem;
+      w.Storage.prototype.setItem = function (key, value) {
+        if (key === core.STORAGE_BACKUP_KEY) throw new Error('Квота исчерпана');
+        return setItem.call(this, key, value);
+      };
+    },
+  });
+  assert.match(app.$('[data-testid="storage-notice"]').textContent, /скачайте/);
+  await app.click(app.button('Скачать копию'));
+  assert.equal(await app.readBlob(app.downloads[0].blob), '{oops');
+  app.w.close();
+});
+
+test('сбой чтения файла проекта показывает сообщение и не меняет схему', async () => {
+  const app = await openApp({ prepare(w) {
+    w.FileReader.prototype.readAsText = function () {
+      setTimeout(() => {
+        Object.defineProperty(this, 'error', { value: new Error('носитель недоступен'), configurable: true });
+        this.dispatchEvent(new w.Event('error'));
+      }, 0);
+    };
+  } });
+  const input = app.$('[data-testid="project-file"]');
+  Object.defineProperty(input, 'files', { value: [new app.w.File(['{}'], 'p.json')], configurable: true });
+  input.dispatchEvent(new app.w.Event('change', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 20));
+  assert.match(app.dialogs.alerts[0], /носитель недоступен/);
+  assert.ok(app.svgTexts().includes('Структурная схема комплекса'));
+  app.w.close();
+});
+
+for (const kind of ['нет контекста', 'исключение до toBlob', 'пустой toBlob', 'исключение в toBlob', 'ошибка изображения']) {
+  test('экспорт PNG сообщает об ошибке: ' + kind, async () => {
+    const app = await openApp({ prepare(w) {
+      w.Image = class {
+        set src(_) { setTimeout(() => kind === 'ошибка изображения' ? this.onerror() : this.onload(), 0); }
+      };
+      w.HTMLCanvasElement.prototype.getContext = () => {
+        if (kind === 'нет контекста') return null;
+        if (kind === 'исключение до toBlob') throw new Error('нет памяти');
+        return { fillRect() {}, drawImage() {} };
+      };
+      w.HTMLCanvasElement.prototype.toBlob = function (done) {
+        if (kind === 'исключение в toBlob') throw new Error('предел canvas');
+        setTimeout(() => done(null), 0);
+      };
+    } });
+    await app.click(app.button('⬇ PNG'));
+    await new Promise(r => setTimeout(r, 20));
+    assert.equal(app.dialogs.alerts.length, 1);
+    assert.match(app.dialogs.alerts[0], /Не удалось сохранить PNG/);
+    assert.equal(app.downloads.length, 0);
+    assert.deepEqual(app.errors, []);
+    app.w.close();
+  });
+}
+
+test('поля количеств не сохраняют отрицательные и дробные значения', async () => {
+  const app = await openApp();
+  await app.tab('Серверная');
+  let input = app.$$('input[type="number"]')[0];
+  await app.type(input, '-3');
+  assert.equal(app.stored().racks[0].servers, 0);
+  await app.type(input, '2.7');
+  assert.equal(app.stored().racks[0].servers, 2);
+  await app.tab('Шкафы автоматики');
+  input = app.$$('input[type="number"]')[0];
+  await app.type(input, '-1');
+  assert.equal(app.stored().autoCabs[0].ctrls, 0);
+  assert.deepEqual(app.errors, []);
+  app.w.close();
+});
+
+test('поля проекта связаны с подписями, а поля строк имеют доступные имена', async () => {
+  const app = await openApp();
+  for (const label of ['Название схемы', 'Подзаголовок', 'Имя выходных файлов', 'Блоков в одном ряду',
+    'Название операторной', 'Название серверной', 'Название помещения шкафов автоматики', 'Текст примечаний']) {
+    const field = app.field(label);
+    assert.ok([...field.labels].some(l => l.textContent.trim() === label), `подпись связана с «${label}»`);
+  }
+  for (const name of ['Операторная', 'Серверная', 'Шкафы автоматики', 'Проект']) {
+    await app.tab(name);
+    app.$$('input:not([type="checkbox"]), select, textarea').forEach(field => {
+      const label = field.getAttribute('aria-label') || [...(field.labels || [])].map(l => l.textContent.trim()).join(' ');
+      assert.ok(label, `доступное имя у ${field.tagName} ${field.getAttribute('type') || ''}`);
+    });
+    app.$$('input[type="checkbox"]').forEach(field => {
+      assert.ok(field.getAttribute('aria-label') || field.labels.length, 'доступное имя у переключателя');
+    });
+  }
+  await app.tab('Проект');
+  await app.click(app.field('Показывать количества сигналов'));
+  await app.tab('Шкафы автоматики');
+  app.$$('input[type="number"]').forEach(field => assert.match(field.getAttribute('aria-label'), /количество|Контроллеров/));
+  assert.deepEqual(app.errors, []);
+  app.w.close();
+});
+
+
+test('пустое количество сигнала остаётся пустым при вводе и после восстановления', async () => {
+  const app = await openApp();
+  await app.click(app.field('Показывать количества сигналов'));
+  await app.tab('Шкафы автоматики');
+  const input = app.$$('input[type="number"]').find(el => (el.getAttribute('aria-label') || '').includes('DI: количество'));
+  assert.ok(input);
+  await app.type(input, '');
+  assert.equal(app.stored().autoCabs[0].diN, '');
+  assert.equal(core.parseState(JSON.stringify(app.stored())).autoCabs[0].diN, '');
+  assert.ok(app.svgTexts().includes('DI'));
   assert.deepEqual(app.errors, []);
   app.w.close();
 });

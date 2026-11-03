@@ -11,14 +11,23 @@
   const C = window.SchemeCore;
 
   // ---------- Состояние проекта ----------
+  // Нечитаемое сохранение не теряется при автосохранении демо-проекта:
+  // отдельно откладываем исходный текст и предлагаем скачать его копию.
   function loadInitialState() {
-    try {
-      const saved = window.localStorage.getItem(C.STORAGE_KEY);
-      if (saved) return C.parseState(saved);
-    } catch (e) {
+    let saved;
+    try { saved = window.localStorage.getItem(C.STORAGE_KEY); }
+    catch (_) { return { state: C.createDefaultState(), unreadable: null }; }
+    if (!saved) return { state: C.createDefaultState(), unreadable: null };
+    try { return { state: C.parseState(saved), unreadable: null }; }
+    catch (e) {
       console.warn('Не удалось восстановить сохранённый проект:', e);
+      let backedUp = false;
+      try {
+        window.localStorage.setItem(C.STORAGE_BACKUP_KEY, saved);
+        backedUp = true;
+      } catch (_) { /* Копию ещё можно скачать, даже если хранилище заполнено. */ }
+      return { state: C.createDefaultState(), unreadable: { text: saved, reason: e.message, backedUp } };
     }
-    return C.createDefaultState();
   }
 
   function saveToStorage(state) {
@@ -39,16 +48,16 @@
 
   // ---------- UI-атомы ----------
   const Inp = (p) => html`<input ...${p} className=${'border border-gray-300 rounded px-2 py-1 text-sm w-full ' + (p.className || '')} />`;
-  const Num = (p) => html`<input type="number" min="0" ...${p} className="border border-gray-300 rounded px-2 py-1 text-sm w-16" />`;
+  const Num = (p) => html`<input type="number" min="0" max=${C.COUNT_MAX} step="1" ...${p} className="border border-gray-300 rounded px-2 py-1 text-sm w-16" />`;
   const Sel = ({ className, children, ...p }) =>
     html`<select ...${p} className=${'border border-gray-300 rounded px-2 py-1 text-sm ' + (className || 'w-full')}>${children}</select>`;
   const Chk = ({ checked, onChange, ...p }) =>
     html`<input ...${p} type="checkbox" checked=${!!checked} onChange=${onChange} className="w-4 h-4 accent-blue-600" />`;
-  const Lbl = ({ children }) => html`<label className="block text-xs font-medium text-gray-600 mb-1">${children}</label>`;
+  const Lbl = ({ label, children }) => html`<label className="block text-xs font-medium text-gray-600"><span className="block mb-1">${label}</span>${children}</label>`;
   const AddBtn = ({ onClick, children }) =>
     html`<button onClick=${onClick} className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800 mt-2">＋ ${children}</button>`;
-  const DelBtn = ({ onClick }) =>
-    html`<button onClick=${onClick} title="Удалить" className="text-red-500 hover:text-red-700 px-2 font-bold">✕</button>`;
+  const DelBtn = ({ onClick, label }) =>
+    html`<button onClick=${onClick} aria-label=${label} title="Удалить" className="text-red-500 hover:text-red-700 px-2 font-bold">✕</button>`;
   const Dash = () => html`<span className="text-gray-300 text-xs">—</span>`;
   const options = (list) => list.map(v => html`<option key=${v}>${v}</option>`);
 
@@ -57,11 +66,15 @@
   const BTN_DRAWIO = BTN + 'bg-indigo-600 hover:bg-indigo-700';
   const BTN_FILE = 'px-3 py-1.5 text-sm rounded border border-gray-300 bg-white text-gray-700 hover:bg-gray-50';
 
+  const rowLabel = (item, index, field) => `${item.name || 'Без названия'} (${index + 1}): ${field}`;
+
   const TABS = [['project', 'Проект'], ['op', 'Операторная'], ['srv', 'Серверная'], ['auto', 'Шкафы автоматики']];
 
   function SchemeGenerator() {
     const [tab, setTab] = useState('project');
-    const [state, setState] = useState(loadInitialState);
+    const [boot] = useState(loadInitialState);
+    const [state, setState] = useState(boot.state);
+    const [unreadable, setUnreadable] = useState(boot.unreadable);
     const fileInput = useRef(null);
     const { project, opItems, racks, netCabs, autoCabs } = state;
 
@@ -89,17 +102,22 @@
       const fail = (why) => alert('Не удалось сохранить ' + ext.slice(1).toUpperCase() + ': ' + why + ' Попробуйте экспорт в SVG.');
       const img = new Image();
       img.onload = () => {
-        const scale = C.rasterScale(model.width, model.height);
-        const c = document.createElement('canvas');
-        c.width = Math.round(model.width * scale); c.height = Math.round(model.height * scale);
-        const ctx = c.getContext('2d');
-        ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, c.width, c.height);
-        ctx.drawImage(img, 0, 0, c.width, c.height);
-        const done = (blob) => blob
-          ? download(blob, fname + ext)
-          : fail('браузер не справился с размером листа.');
-        try { c.toBlob(done, type, 0.95); }
-        catch (err) { fail(err.message + '.'); }
+        try {
+          const scale = C.rasterScale(model.width, model.height);
+          const c = document.createElement('canvas');
+          c.width = Math.round(model.width * scale); c.height = Math.round(model.height * scale);
+          const ctx = c.getContext('2d');
+          if (!ctx) { fail('браузер не выделил память под картинку.'); return; }
+          ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, c.width, c.height);
+          ctx.drawImage(img, 0, 0, c.width, c.height);
+          const done = (blob) => {
+            try {
+              if (blob) download(blob, fname + ext);
+              else fail('браузер не справился с размером листа.');
+            } catch (err) { fail(err.message + '.'); }
+          };
+          c.toBlob(done, type, 0.95);
+        } catch (err) { fail(err.message + '.'); }
       };
       img.onerror = () => fail('браузер не смог разобрать схему.');
       img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
@@ -117,6 +135,7 @@
         try { setState(C.parseState(String(reader.result))); }
         catch (err) { alert('Не удалось открыть проект: ' + err.message); }
       };
+      reader.onerror = () => alert('Не удалось прочитать файл: ' + (reader.error ? reader.error.message : 'ошибка чтения'));
       reader.readAsText(file);
     };
     const resetProject = () => {
@@ -126,20 +145,30 @@
     };
 
     // ---------- Выбор целей ----------
-    const targetSelect = (value, onChange, allowPanel) => html`
-      <${Sel} value=${value || ''} onChange=${onChange}>
-        ${netCabs.map(c => html`<option key=${c.id} value=${c.id}>${c.name}</option>`)}
-        ${racks.map(r => html`<option key=${r.id} value=${r.id}>${r.name}</option>`)}
+    const targetSelect = (value, onChange, allowPanel, label) => html`
+      <${Sel} value=${value || ''} onChange=${onChange} aria-label=${label}>
+        ${netCabs.map((c, row) => html`<option key=${c.id} value=${c.id}>${c.name}</option>`)}
+        ${racks.map((r, row) => html`<option key=${r.id} value=${r.id}>${r.name}</option>`)}
         ${allowPanel && project.kvmPanel && html`<option value=${C.KVM_PANEL_ID}>${project.kvmPanelName}</option>`}
       <//>`;
-    const netSelect = (value, onChange) => html`
-      <${Sel} value=${value || ''} onChange=${onChange}>
-        ${netCabs.map(c => html`<option key=${c.id} value=${c.id}>${c.name}</option>`)}
+    const netSelect = (value, onChange, label) => html`
+      <${Sel} value=${value || ''} onChange=${onChange} aria-label=${label}>
+        ${netCabs.map((c, row) => html`<option key=${c.id} value=${c.id}>${c.name}</option>`)}
       <//>`;
-    const autoTargetSelect = (sourceId, value, onChange) => html`
-      <${Sel} value=${effAutoTarget(value, sourceId) || ''} onChange=${onChange}>
+    const autoTargetSelect = (sourceId, value, onChange, label) => html`
+      <${Sel} value=${effAutoTarget(value, sourceId) || ''} onChange=${onChange} aria-label=${label}>
         ${autoCabs.filter(c => c.id !== sourceId).map(c => html`<option key=${c.id} value=${c.id}>${c.name}</option>`)}
       <//>`;
+
+    const storageNotice = () => unreadable && html`
+      <div role="alert" data-testid="storage-notice"
+        className="flex flex-wrap items-center gap-2 mb-4 p-3 rounded border border-gray-300 bg-gray-50 text-sm text-amber-700">
+        <span>Сохранённый в браузере проект не открылся: ${unreadable.reason} Показан пример.
+          ${unreadable.backedUp ? 'Копия старых данных отложена в браузере.' : 'Копию в браузере сохранить не удалось — скачайте её.'}</span>
+        <button onClick=${() => download(new Blob([unreadable.text], { type: 'application/json' }), 'unreadable_project.json')}
+          className=${BTN_FILE}>Скачать копию</button>
+        <button onClick=${() => setUnreadable(null)} className=${BTN_FILE}>Скрыть</button>
+      </div>`;
 
     // ---------- Вкладки ----------
     const projectTab = () => html`
@@ -149,25 +178,25 @@
           <button onClick=${saveProject} className=${BTN_FILE}>Сохранить проект</button>
           <button onClick=${() => fileInput.current && fileInput.current.click()} className=${BTN_FILE}>Открыть проект</button>
           <button onClick=${resetProject} className=${BTN_FILE}>Начать заново</button>
-          <input ref=${fileInput} type="file" accept=".json,application/json" className="hidden" onChange=${openProject} data-testid="project-file" />
+          <input ref=${fileInput} type="file" aria-label="Файл проекта" accept=".json,application/json" className="hidden" onChange=${openProject} data-testid="project-file" />
           <span className="text-xs text-gray-500">Изменения автоматически сохраняются в этом браузере.</span>
         </div>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div><${Lbl}>Название схемы<//><${Inp} ...${bindText('title')} /></div>
-          <div><${Lbl}>Подзаголовок<//><${Inp} ...${bindText('subtitle')} /></div>
-          <div><${Lbl}>Имя выходных файлов<//><${Inp} ...${bindText('fileName')} /></div>
-          <div><${Lbl}>Блоков в одном ряду<//><${Num} ...${bindText('blocksPerRow')} min="1" /></div>
-          <div><${Lbl}>Название операторной<//><${Inp} ...${bindText('operatorName')} /></div>
-          <div><${Lbl}>Название серверной<//><${Inp} ...${bindText('serverName')} /></div>
-          <div><${Lbl}>Название помещения шкафов автоматики<//><${Inp} ...${bindText('autoName')} /></div>
+          <div><${Lbl} label="Название схемы"><${Inp} ...${bindText('title')} /><//></div>
+          <div><${Lbl} label="Подзаголовок"><${Inp} ...${bindText('subtitle')} /><//></div>
+          <div><${Lbl} label="Имя выходных файлов"><${Inp} ...${bindText('fileName')} /><//></div>
+          <div><${Lbl} label="Блоков в одном ряду"><${Num} ...${bindText('blocksPerRow')} min="1" max=${C.PER_ROW_MAX} /><//></div>
+          <div><${Lbl} label="Название операторной"><${Inp} ...${bindText('operatorName')} /><//></div>
+          <div><${Lbl} label="Название серверной"><${Inp} ...${bindText('serverName')} /><//></div>
+          <div><${Lbl} label="Название помещения шкафов автоматики"><${Inp} ...${bindText('autoName')} /><//></div>
           <div className="flex items-center gap-6 pt-4">
             <label className="flex items-center gap-2 text-sm"><${Chk} ...${bindCheck('showNotes')} />Показывать примечания</label>
             <label className="flex items-center gap-2 text-sm"><${Chk} ...${bindCheck('showSignalCounts')} />Показывать количества сигналов</label>
           </div>
           ${project.showNotes && html`
-            <div className="md:col-span-2"><${Lbl}>Текст примечаний<//>
+            <div className="md:col-span-2"><${Lbl} label="Текст примечаний">
               <textarea ...${bindText('notesText')} className="border border-gray-300 rounded px-2 py-1 text-sm w-full h-20" />
-            </div>`}
+            <//></div>`}
         </div>
       </div>`;
 
@@ -181,7 +210,7 @@
           ${project.kvmPanel && html`
             <div className="flex items-center gap-2">
               <span className="text-xs text-gray-500">Название:</span>
-              <${Inp} className="w-64" ...${bindText('kvmPanelName')} />
+              <${Inp} className="w-64" aria-label="Название щита КВМ-удлинителей" ...${bindText('kvmPanelName')} />
             </div>`}
         </div>
         <div className="grid grid-cols-12 gap-2 text-xs font-semibold text-gray-500 mb-1 px-1">
@@ -189,24 +218,24 @@
           <div className="col-span-2">Связь</div><div className="col-span-3">Куда</div>
           <div>KVM→щит</div><div></div>
         </div>
-        ${opItems.map(it => html`
+        ${opItems.map((it, row) => html`
           <div key=${it.id} className="grid grid-cols-12 gap-2 items-center mb-1">
-            <div className="col-span-3"><${Inp} value=${it.name} onChange=${e => updOp(it.id, 'name', e.target.value)} /></div>
+            <div className="col-span-3"><${Inp} aria-label=${rowLabel(it, row, 'Название')} value=${it.name} onChange=${e => updOp(it.id, 'name', e.target.value)} /></div>
             <div className="col-span-2">
-              <${Sel} value=${it.type} onChange=${e => updOp(it.id, 'type', e.target.value)}>${options(C.OP_TYPES)}<//>
+              <${Sel} aria-label=${rowLabel(it, row, 'Тип')} value=${it.type} onChange=${e => updOp(it.id, 'type', e.target.value)}>${options(C.OP_TYPES)}<//>
             </div>
             <div className="col-span-2">
-              <${Sel} value=${it.link} onChange=${e => updOp(it.id, 'link', e.target.value)}>${options(C.OP_LINKS)}<//>
+              <${Sel} aria-label=${rowLabel(it, row, 'Связь')} value=${it.link} onChange=${e => updOp(it.id, 'link', e.target.value)}>${options(C.OP_LINKS)}<//>
             </div>
             <div className="col-span-3">
-              ${targetSelect(effTarget(it.target, true), e => updOp(it.id, 'target', e.target.value), true)}
+              ${targetSelect(effTarget(it.target, true), e => updOp(it.id, 'target', e.target.value), true, rowLabel(it, row, 'Куда'))}
             </div>
             <div>
               ${project.kvmPanel && effTarget(it.target, true) !== C.KVM_PANEL_ID
-                ? html`<${Chk} checked=${it.kvmToPanel} onChange=${e => updOp(it.id, 'kvmToPanel', e.target.checked)} />`
+                ? html`<${Chk} aria-label=${rowLabel(it, row, 'KVM к щиту')} checked=${it.kvmToPanel} onChange=${e => updOp(it.id, 'kvmToPanel', e.target.checked)} />`
                 : html`<${Dash} />`}
             </div>
-            <${DelBtn} onClick=${() => del('opItems')(it.id)} />
+            <${DelBtn} label=${rowLabel(it, row, 'Удалить')} onClick=${() => del('opItems')(it.id)} />
           </div>`)}
         <${AddBtn} onClick=${add('opItems', C.newOpItem)}>Добавить<//>
       </div>`;
@@ -219,16 +248,16 @@
             <div className="col-span-4">Название</div><div>Серверов</div><div className="col-span-3">Подключение к</div>
             <div>KVM</div><div>NTP</div><div>ИБП</div><div></div>
           </div>
-          ${racks.map(r => html`
+          ${racks.map((r, row) => html`
             <div key=${r.id} className="grid grid-cols-12 gap-2 items-center mb-1">
-              <div className="col-span-4"><${Inp} value=${r.name} onChange=${e => updRack(r.id, 'name', e.target.value)} /></div>
-              <div><${Num} value=${r.servers} onChange=${e => updRack(r.id, 'servers', Number(e.target.value))} /></div>
-              <div className="col-span-3">${netSelect(effNet(r.netTarget), e => updRack(r.id, 'netTarget', e.target.value))}</div>
-              <div><${Chk} checked=${r.kvm} title="Стойка подключается к щиту КВМ-удлинителей (вкладка «Операторная»)"
+              <div className="col-span-4"><${Inp} aria-label=${rowLabel(r, row, 'Название')} value=${r.name} onChange=${e => updRack(r.id, 'name', e.target.value)} /></div>
+              <div><${Num} aria-label=${rowLabel(r, row, 'Серверов')} value=${r.servers} onChange=${e => updRack(r.id, 'servers', C.toCount(e.target.value))} /></div>
+              <div className="col-span-3">${netSelect(effNet(r.netTarget), e => updRack(r.id, 'netTarget', e.target.value), rowLabel(r, row, 'Подключение к'))}</div>
+              <div><${Chk} aria-label=${rowLabel(r, row, 'KVM')} checked=${r.kvm} title="Стойка подключается к щиту КВМ-удлинителей (вкладка «Операторная»)"
                 onChange=${e => updRack(r.id, 'kvm', e.target.checked)} /></div>
-              <div><${Chk} checked=${r.ntp} onChange=${e => updRack(r.id, 'ntp', e.target.checked)} /></div>
-              <div><${Chk} checked=${r.ups} onChange=${e => updRack(r.id, 'ups', e.target.checked)} /></div>
-              <${DelBtn} onClick=${() => del('racks')(r.id)} />
+              <div><${Chk} aria-label=${rowLabel(r, row, 'NTP')} checked=${r.ntp} onChange=${e => updRack(r.id, 'ntp', e.target.checked)} /></div>
+              <div><${Chk} aria-label=${rowLabel(r, row, 'ИБП')} checked=${r.ups} onChange=${e => updRack(r.id, 'ups', e.target.checked)} /></div>
+              <${DelBtn} label=${rowLabel(r, row, 'Удалить')} onClick=${() => del('racks')(r.id)} />
             </div>`)}
           ${!project.kvmPanel && racks.some(r => r.kvm) && html`
             <p className="text-xs text-amber-700 mt-1">Линия KVM от стойки строится только при включённом «Щите КВМ-удлинителей» — включите его на вкладке «Операторная».</p>`}
@@ -240,21 +269,21 @@
             <div className="col-span-4">Название</div><div>Комм.</div><div>МЭ</div><div className="col-span-2">Опт. кроссы</div>
             <div className="col-span-2">Внешняя связь</div><div>ИБП</div><div></div>
           </div>
-          ${netCabs.map(c => html`
+          ${netCabs.map((c, row) => html`
             <div key=${c.id} className="grid grid-cols-12 gap-2 items-center mb-1">
-              <div className="col-span-4"><${Inp} value=${c.name} onChange=${e => updNet(c.id, 'name', e.target.value)} /></div>
-              <div><${Num} value=${c.switches} onChange=${e => updNet(c.id, 'switches', Number(e.target.value))} /></div>
-              <div><${Num} value=${c.fw} onChange=${e => updNet(c.id, 'fw', Number(e.target.value))} /></div>
-              <div className="col-span-2"><${Num} value=${c.cross} onChange=${e => updNet(c.id, 'cross', Number(e.target.value))} /></div>
-              <div className="col-span-2"><${Chk} checked=${c.external} onChange=${e => updNet(c.id, 'external', e.target.checked)} /></div>
-              <div><${Chk} checked=${c.ups} onChange=${e => updNet(c.id, 'ups', e.target.checked)} /></div>
-              <${DelBtn} onClick=${() => del('netCabs')(c.id)} />
+              <div className="col-span-4"><${Inp} aria-label=${rowLabel(c, row, 'Название')} value=${c.name} onChange=${e => updNet(c.id, 'name', e.target.value)} /></div>
+              <div><${Num} aria-label=${rowLabel(c, row, 'Коммутаторов')} value=${c.switches} onChange=${e => updNet(c.id, 'switches', C.toCount(e.target.value))} /></div>
+              <div><${Num} aria-label=${rowLabel(c, row, 'Межсетевых экранов')} value=${c.fw} onChange=${e => updNet(c.id, 'fw', C.toCount(e.target.value))} /></div>
+              <div className="col-span-2"><${Num} aria-label=${rowLabel(c, row, 'Оптических кроссов')} value=${c.cross} onChange=${e => updNet(c.id, 'cross', C.toCount(e.target.value))} /></div>
+              <div className="col-span-2"><${Chk} aria-label=${rowLabel(c, row, 'Внешняя связь')} checked=${c.external} onChange=${e => updNet(c.id, 'external', e.target.checked)} /></div>
+              <div><${Chk} aria-label=${rowLabel(c, row, 'ИБП')} checked=${c.ups} onChange=${e => updNet(c.id, 'ups', e.target.checked)} /></div>
+              <${DelBtn} label=${rowLabel(c, row, 'Удалить')} onClick=${() => del('netCabs')(c.id)} />
             </div>`)}
           <${AddBtn} onClick=${add('netCabs', C.newNetCab)}>Добавить сетевой шкаф<//>
         </div>
       </div>`;
 
-    const SIGNAL_FIELDS = [['di', 'diN'], ['dO', 'doN'], ['ai', 'aiN'], ['ao', 'aoN']];
+    const SIGNAL_FIELDS = [['di', 'diN', 'DI'], ['dO', 'doN', 'DO'], ['ai', 'aiN', 'AI'], ['ao', 'aoN', 'AO']];
     const autoTab = () => html`
       <div className="overflow-x-auto">
         <div className="flex items-center gap-2 text-xs font-semibold text-gray-500 mb-1 px-1">
@@ -265,35 +294,35 @@
           <div className="w-16 shrink-0">RS-485 вниз</div>
           <div className="w-24 shrink-0">RS-485 между</div><div className="w-44 shrink-0">Связать со шкафом</div><div></div>
         </div>
-        ${autoCabs.map(c => html`
+        ${autoCabs.map((c, row) => html`
           <div key=${c.id} className="flex items-start gap-2 mb-1">
-            <div className="w-40 shrink-0"><${Inp} value=${c.name} onChange=${e => updAuto(c.id, 'name', e.target.value)} /></div>
-            <div className="w-16 shrink-0"><${Num} value=${c.ctrls} onChange=${e => updAuto(c.id, 'ctrls', Number(e.target.value))} /></div>
+            <div className="w-40 shrink-0"><${Inp} aria-label=${rowLabel(c, row, 'Название')} value=${c.name} onChange=${e => updAuto(c.id, 'name', e.target.value)} /></div>
+            <div className="w-16 shrink-0"><${Num} aria-label=${rowLabel(c, row, 'Контроллеров')} value=${c.ctrls} onChange=${e => updAuto(c.id, 'ctrls', C.toCount(e.target.value))} /></div>
             <div className="w-28 shrink-0">
-              <${Sel} value=${c.uplink} onChange=${e => updAuto(c.id, 'uplink', e.target.value)}>${options(C.AUTO_UPLINK_OPTIONS)}<//>
+              <${Sel} aria-label=${rowLabel(c, row, 'Связь сверху')} value=${c.uplink} onChange=${e => updAuto(c.id, 'uplink', e.target.value)}>${options(C.AUTO_UPLINK_OPTIONS)}<//>
             </div>
             <div className="w-44 shrink-0">
               ${c.uplink === C.UPLINK_NONE
                 ? html`<${Dash} />`
-                : netSelect(effNet(c.netTarget), e => updAuto(c.id, 'netTarget', e.target.value))}
+                : netSelect(effNet(c.netTarget), e => updAuto(c.id, 'netTarget', e.target.value), rowLabel(c, row, 'Куда'))}
             </div>
-            ${SIGNAL_FIELDS.map(([f, nf]) => html`
+            ${SIGNAL_FIELDS.map(([f, nf, name]) => html`
               <div key=${f} className="w-8 shrink-0 flex flex-col items-start gap-1 pt-1">
-                <${Chk} checked=${c[f]} onChange=${e => updAuto(c.id, f, e.target.checked)} />
+                <${Chk} aria-label=${rowLabel(c, row, name)} checked=${c[f]} onChange=${e => updAuto(c.id, f, e.target.checked)} />
                 ${project.showSignalCounts && c[f] && html`
-                  <input type="number" min="0" value=${c[nf]} onChange=${e => updAuto(c.id, nf, Number(e.target.value))}
+                  <input type="number" aria-label=${rowLabel(c, row, name + ': количество')} min="0" max=${C.COUNT_MAX} step="1" value=${c[nf]} onChange=${e => updAuto(c.id, nf, e.target.value === '' ? '' : C.toCount(e.target.value))}
                     className="border border-gray-300 rounded px-1 py-0.5 text-xs w-12" />`}
               </div>`)}
-            <div className="w-16 shrink-0 pt-1"><${Chk} checked=${c.rs485} onChange=${e => updAuto(c.id, 'rs485', e.target.checked)} /></div>
+            <div className="w-16 shrink-0 pt-1"><${Chk} aria-label=${rowLabel(c, row, 'RS-485 вниз')} checked=${c.rs485} onChange=${e => updAuto(c.id, 'rs485', e.target.checked)} /></div>
             <div className="w-24 shrink-0 pt-1">
-              <${Chk} checked=${c.rs485Cab} disabled=${autoCabs.length < 2} onChange=${e => updAuto(c.id, 'rs485Cab', e.target.checked)} />
+              <${Chk} aria-label=${rowLabel(c, row, 'RS-485 между шкафами')} checked=${c.rs485Cab} disabled=${autoCabs.length < 2} onChange=${e => updAuto(c.id, 'rs485Cab', e.target.checked)} />
             </div>
             <div className="w-44 shrink-0">
               ${c.rs485Cab && autoCabs.length > 1
-                ? autoTargetSelect(c.id, c.rs485Target, e => updAuto(c.id, 'rs485Target', e.target.value))
+                ? autoTargetSelect(c.id, c.rs485Target, e => updAuto(c.id, 'rs485Target', e.target.value), rowLabel(c, row, 'Связать со шкафом'))
                 : html`<${Dash} />`}
             </div>
-            <${DelBtn} onClick=${() => del('autoCabs')(c.id)} />
+            <${DelBtn} label=${rowLabel(c, row, 'Удалить')} onClick=${() => del('autoCabs')(c.id)} />
           </div>`)}
         <${AddBtn} onClick=${add('autoCabs', C.newAutoCab)}>Добавить шкаф<//>
       </div>`;
@@ -304,6 +333,7 @@
       <div className="p-4 bg-gray-100 min-h-screen font-sans">
         <div className="max-w-6xl mx-auto space-y-4">
           <div className="bg-white rounded-lg shadow p-4">
+            ${storageNotice()}
             <div className="flex flex-wrap gap-2 border-b border-gray-200 pb-2 mb-4">
               ${TABS.map(([k, l]) => html`
                 <button key=${k} onClick=${() => setTab(k)}
