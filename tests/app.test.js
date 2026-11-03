@@ -111,6 +111,17 @@ test('повреждённое сохранение не мешает запус
   app.w.close();
 });
 
+test('нечитаемое сохранение не затирается: копия отложена, есть предупреждение', async () => {
+  const app = await openApp({ storage: { [core.STORAGE_KEY]: '{oops' } });
+  assert.equal(app.w.localStorage.getItem(core.STORAGE_BACKUP_KEY), '{oops', 'копия отложена до перезаписи');
+  assert.ok(app.$('[data-testid="storage-notice"]'), 'пользователь видит предупреждение');
+  await app.click(app.button('Скачать копию'));
+  assert.equal(await app.readBlob(app.downloads[0].blob), '{oops');
+  await app.click(app.button('Скрыть'));
+  assert.equal(app.$('[data-testid="storage-notice"]'), null, 'предупреждение скрывается');
+  app.w.close();
+});
+
 test('«Без связи» выключает верхнюю линию шкафа автоматики', async () => {
   const app = await openApp();
   await app.tab('Шкафы автоматики');

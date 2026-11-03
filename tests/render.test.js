@@ -86,3 +86,14 @@ test('связи Draw.io идут по тем же точкам, что и в SV
     assert.deepEqual(pts, expected);
   });
 });
+
+test('Draw.io остаётся корректным XML при необычных id из чужого файла', () => {
+  const odd = 'n"1 <&>';
+  const state = core.parseState(JSON.stringify({
+    netCabs: [{ id: odd, name: 'ШС' }], autoCabs: [{ id: 'a1', name: 'ША', netTarget: odd }],
+  }));
+  const model = core.buildScheme(state);
+  const cells = [...parseXml(core.toDrawio(model)).getElementsByTagName('mxCell')];
+  assert.ok(cells.some(c => c.getAttribute('id') === 'b_' + odd), 'ячейка блока с исходным id');
+  assert.ok(cells.some(c => c.getAttribute('target') === 'b_' + odd), 'связь ссылается на блок');
+});
