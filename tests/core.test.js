@@ -87,3 +87,40 @@ test('rasterScale укладывает картинку в предел canvas �
   assert.ok(6000 * big * 3000 * big <= core.RASTER_MAX_PIXELS + 1, 'площадь картинки не больше предела');
   assert.ok(core.rasterScale(1e6, 1e6) > 0, 'огромный лист всё равно даёт положительный масштаб');
 });
+
+test('toCount ограничивает количества и возвращает запасное значение для мусора', () => {
+  assert.equal(core.toCount('-3'), 0);
+  assert.equal(core.toCount('2.7'), 2);
+  assert.equal(core.toCount(1e9), core.COUNT_MAX);
+  assert.equal(core.toCount('abc', 8), 8);
+  assert.equal(core.toCount(Infinity, 8), 8);
+  assert.equal(core.toCount(''), 0);
+});
+
+test('строгий порядок встречных вертикалей учитывает концы пролётов', () => {
+  const hs = [
+    { x1: 0, x2: 100, top: [], bot: [100] },
+    { x1: 100, x2: 200, top: [100], bot: [] },
+  ];
+  core.routeBand(hs, { hard: true });
+  assert.ok(hs[1].track < hs[0].track, 'уходящая вверх линия выше приходящей снизу');
+});
+
+test('wrapText переносит слова и разбивает слово длиннее строки', () => {
+  assert.deepEqual(core.wrapText('Первое предложение\nВторое', 10), ['Первое', 'предложени', 'е', 'Второе']);
+  assert.deepEqual(core.wrapText('abcdefghij', 4), ['abcd', 'efgh', 'ij']);
+  assert.deepEqual(core.wrapText('  ', 10), []);
+  assert.deepEqual(core.wrapText('', 10), []);
+});
+
+
+test('пары RS-485 с разделителем в id не смешиваются', () => {
+  const state = core.normalizeState({ autoCabs: [
+    { id: 'a|b', rs485Cab: true, rs485Target: 'c' },
+    { id: 'c' },
+    { id: 'a', rs485Cab: true, rs485Target: 'b|c' },
+    { id: 'b|c' },
+  ] });
+  const links = core.buildScheme(state).conns.filter(c => c.cabLink);
+  assert.deepEqual(links.map(c => [c.src.id, c.tgt.id]), [['a|b', 'c'], ['a', 'b|c']]);
+});

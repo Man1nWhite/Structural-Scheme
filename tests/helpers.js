@@ -115,6 +115,7 @@ function layoutProblems(model) {
   });
   if (model.legend.y + model.legend.h > model.height) problems.push('легенда выходит за лист');
   if (model.notes && model.notes.y + 20 + model.notes.lines.length * 16 > model.height) problems.push('примечания выходят за лист');
+  if (model.notes && model.notes.lines.some(line => line.length * 6 > model.notes.w)) problems.push('строка примечаний выходит за ширину листа');
 
   return problems;
 }

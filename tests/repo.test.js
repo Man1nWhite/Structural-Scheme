@@ -8,7 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 const { ROOT, read } = require('./helpers');
 const { FILES } = require('../scripts/vendor.js');
-const { build, OUT, SHELL } = require('../scripts/build.js');
+const { build, OUT, SHELL, inlineCode, inlineCss } = require('../scripts/build.js');
 
 test('каркас страницы ссылается на существующие файлы и не ходит в интернет', () => {
   const html = read(SHELL);
@@ -58,4 +58,35 @@ test('src/styles.css собран из актуальных классов (npm 
     '-c', 'tailwind.config.js', '-i', 'src/tailwind.css', '-o', out, '--minify',
   ], { cwd: ROOT, stdio: 'pipe' });
   assert.equal(read('src/styles.css'), fs.readFileSync(out, 'utf8'), 'src/styles.css устарел — выполните npm run build:css');
+});
+
+test('встроенный код не закрывает <script> раньше времени', () => {
+  const { JSDOM } = require('jsdom');
+  const code = 'window.s = "a</script><b>" + "<!--<script>" + "</SCRIPT\\t>" + "</script\\n>";';
+  const dom = new JSDOM(`<script>${inlineCode(code)}</script><p id="after"></p>`, { runScripts: 'dangerously' });
+  assert.equal(dom.window.s, 'a</script><b><!--<script></SCRIPT\t></script\n>');
+  assert.ok(dom.window.document.getElementById('after'), 'разметка после скрипта не потерялась');
+  assert.equal(dom.window.document.scripts.length, 1);
+  dom.window.close();
+});
+
+test('экранирование комментария сохраняет значение строки и регулярного выражения', () => {
+  const { JSDOM } = require('jsdom');
+  const code = 'window.s = "<!--"; window.re = /<!--/u.test(window.s);';
+  const dom = new JSDOM(`<script>${inlineCode(code)}</script>`, { runScripts: 'dangerously' });
+  assert.equal(dom.window.s, '<!--');
+  assert.equal(dom.window.re, true);
+  dom.window.close();
+});
+
+test('встроенные стили не закрывают <style> раньше времени', () => {
+  const { JSDOM } = require('jsdom');
+  const css = '.example::before { content: "a</style><b></STYLE >"; }';
+  const dom = new JSDOM(`<style>${inlineCss(css)}</style><p id="after" class="example"></p>`);
+  const doc = dom.window.document;
+  assert.equal(doc.querySelectorAll('style').length, 1);
+  assert.ok(doc.getElementById('after'), 'разметка после стилей не потерялась');
+  assert.equal(doc.querySelector('#after').tagName, 'P');
+  assert.equal(doc.styleSheets[0].cssRules.length, 1, 'CSS разобран как одно правило');
+  dom.window.close();
 });

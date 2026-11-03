@@ -67,3 +67,20 @@ test('загруженный проект сразу строится', () => {
   assert.equal(m.blocks.length, 1);
   assert.equal(m.conns.length, 0, 'без серверной связь некуда вести');
 });
+
+test('количества из чужого файла — целые неотрицательные числа', () => {
+  const s = core.normalizeState({
+    racks: [{ servers: -3 }, { servers: 'abc' }, { servers: '' }],
+    netCabs: [{ switches: '2.7', fw: 'много' }],
+    autoCabs: [{ diN: 1e9, aiN: '', ctrls: -1 }],
+  });
+  assert.equal(s.racks[0].servers, 0);
+  assert.equal(s.racks[1].servers, core.ITEM_DEFAULTS.racks.servers);
+  assert.equal(s.racks[2].servers, 0, 'пустое количество оборудования не остаётся строкой');
+  assert.equal(s.netCabs[0].switches, 2);
+  assert.equal(s.netCabs[0].fw, core.ITEM_DEFAULTS.netCabs.fw);
+  assert.equal(s.autoCabs[0].diN, core.COUNT_MAX);
+  assert.equal(s.autoCabs[0].aiN, '', 'пустое количество сигнала остаётся скрытым');
+  assert.equal(s.autoCabs[0].ctrls, 0);
+  assert.deepEqual(core.parseState(core.serializeState(s)), s, 'нормализованные значения переживают сохранение');
+});

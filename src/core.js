@@ -44,6 +44,27 @@
     return [...m.values()];
   };
   const fit = (s, n) => { s = String(s == null ? '' : s); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
+  // Перенос по словам с разбивкой слишком длинного слова. Оценка ширины символа
+  // та же, что у fit; модель заранее готовит одинаковые строки для SVG и Draw.io.
+  const wrapText = (value, width) => {
+    const limit = Math.max(1, Math.floor(width));
+    return String(value == null ? '' : value).split(/\r?\n/).flatMap(line => {
+      const words = line.trim().split(/\s+/).filter(Boolean), lines = [];
+      let current = '';
+      words.forEach(word => {
+        while (word.length > limit) {
+          if (current) { lines.push(current); current = ''; }
+          lines.push(word.slice(0, limit));
+          word = word.slice(limit);
+        }
+        if (!word) return;
+        if (current && current.length + 1 + word.length > limit) { lines.push(current); current = word; }
+        else current += (current ? ' ' : '') + word;
+      });
+      if (current) lines.push(current);
+      return lines;
+    });
+  };
   const pad2 = n => String(n).padStart(2, '0');
   const signalLabel = (signal, showCounts) =>
     showCounts && signal.n != null && signal.n !== '' ? `${signal.k} (${signal.n})` : signal.k;
@@ -54,6 +75,13 @@
   const clampPerRow = (value) => {
     const n = Math.floor(Number(value));
     return Number.isFinite(n) ? Math.min(PER_ROW_MAX, Math.max(1, n)) : 1;
+  };
+  // Количества оборудования и сигналов — целые неотрицательные числа.
+  // Пустое количество сигнала обрабатывается отдельно в normalizeState.
+  const COUNT_MAX = 99999;
+  const toCount = (value, fallback = 0) => {
+    const n = Math.floor(Number(value));
+    return Number.isFinite(n) ? Math.min(COUNT_MAX, Math.max(0, n)) : fallback;
   };
   const signalsOf = (c) => {
     const s = [];
@@ -203,6 +231,7 @@
   const FORMAT = 'structural-scheme';
   const FORMAT_VERSION = 1;
   const STORAGE_KEY = 'structural-scheme:project';
+  const STORAGE_BACKUP_KEY = STORAGE_KEY + ':unreadable';
 
   function serializeState(state) {
     const out = { format: FORMAT, version: FORMAT_VERSION, project: state.project };
@@ -242,6 +271,14 @@
       const list = Array.isArray(raw[k]) ? raw[k] : [];
       state[k] = list.filter(isPlainObject).map(item => {
         const it = pickKnown(item, ITEM_DEFAULTS[k]);
+        // Пустая строка скрывает количество сигнала (signalLabel), остальные
+        // числовые поля получают целое значение в допустимых пределах.
+        Object.keys(ITEM_DEFAULTS[k]).forEach(f => {
+          const d = ITEM_DEFAULTS[k][f];
+          if (typeof d === 'number' && !(k === 'autoCabs' && ['diN', 'doN', 'aiN', 'aoN'].includes(f) && it[f] === '')) {
+            it[f] = toCount(it[f], d);
+          }
+        });
         if (!it.id || seen.has(it.id)) it.id = uid();
         seen.add(it.id);
         return it;
@@ -281,54 +318,62 @@
   // Раздача каналов внутри одной горизонтальной полосы.
   // h: { x1, x2, top:[x...], bot:[x...] } — пролёт и абсциссы вертикалей, подходящих к нему сверху/снизу.
   // Строится граф «кто обязан быть выше кого», затем каналы раздаются без пересечений (где это возможно).
-  function routeBand(hs) {
+  // Порядок 1 (короткие пролёты раньше) сохраняет геометрию backup. Порядок 2
+  // (длинные раньше) берётся, только если уменьшает число каналов. При равенстве
+  // всегда выигрывает первый порядок. hard — последняя ступень починки маршрутов.
+  function routeBand(hs, { hard = false } = {}) {
     const n = hs.length;
     hs.forEach(h => { h.track = -1; });
     if (!n) return 0;
-    const above = hs.map(() => new Set()); // above[i] — пролёты, которые должны лежать ВЫШЕ i
-    for (let i = 0; i < n; i++) {
-      for (let j = 0; j < n; j++) {
-        if (i === j) continue;
-        const A = hs[i], B = hs[j];
-        const inside = x => x > A.x1 && x < A.x2;
-        if (B.top.some(inside)) above[i].add(j); // вертикаль B сверху пересекает пролёт A → A ниже B
-        if (B.bot.some(inside)) above[j].add(i); // вертикаль B снизу пересекает пролёт A → A выше B
-      }
+    const soft = hs.map(() => new Set()), must = hs.map(() => new Set());
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+      if (i === j) continue;
+      const A = hs[i], B = hs[j], inside = x => x > A.x1 && x < A.x2;
+      if (B.top.some(inside)) soft[i].add(j);
+      if (B.bot.some(inside)) soft[j].add(i);
+      // Встречные вертикали на конце пролёта: уходящая вверх линия должна
+      // быть выше приходящей снизу, иначе их участки у грани совпадут.
+      if (hard && A.bot.some(x => B.top.some(y => Math.abs(x - y) < 0.5))) must[i].add(j);
     }
-    const placed = new Array(n).fill(false), order = [];
-    for (let s = 0; s < n; s++) {
-      let best = -1, bestCnt = Infinity, bestLen = Infinity;
-      for (let i = 0; i < n; i++) {
-        if (placed[i]) continue;
-        let cnt = 0;
-        above[i].forEach(j => { if (!placed[j]) cnt++; });
-        const len = hs[i].x2 - hs[i].x1;
-        if (cnt < bestCnt || (cnt === bestCnt && len < bestLen)) { best = i; bestCnt = cnt; bestLen = len; }
+    const span = i => hs[i].x2 - hs[i].x1;
+    const waiting = (set, placed) => { let count = 0; set.forEach(j => { if (!placed[j]) count++; }); return count; };
+    const before = (a, b) => {
+      for (let k = 0; k < a.length; k++) if (a[k] !== b[k]) return a[k] < b[k];
+      return false;
+    };
+    const run = (sign) => {
+      const track = new Array(n).fill(-1), placed = new Array(n).fill(false);
+      for (let s = 0; s < n; s++) {
+        let best = -1, bestKey = null;
+        for (let i = 0; i < n; i++) {
+          if (placed[i]) continue;
+          const key = [waiting(must[i], placed), waiting(soft[i], placed), sign * span(i)];
+          if (best < 0 || before(key, bestKey)) { best = i; bestKey = key; }
+        }
+        placed[best] = true;
+        let t = 0;
+        const raise = j => { if (track[j] >= 0) t = Math.max(t, track[j] + 1); };
+        soft[best].forEach(raise); must[best].forEach(raise);
+        const h = hs[best];
+        const busy = tt => hs.some((o, k) => k !== best && track[k] === tt && !(o.x2 + 4 < h.x1 || o.x1 > h.x2 + 4));
+        while (busy(t)) t++;
+        track[best] = t;
       }
-      placed[best] = true;
-      order.push(best);
-    }
-    let tracks = 0;
-    order.forEach(i => {
-      let t = 0;
-      above[i].forEach(j => { if (hs[j].track >= 0) t = Math.max(t, hs[j].track + 1); });
-      const busy = tt => hs.some((h, k) => k !== i && h.track === tt && !(h.x2 + 4 < hs[i].x1 || h.x1 > hs[i].x2 + 4));
-      while (busy(t)) t++;
-      hs[i].track = t;
-      tracks = Math.max(tracks, t + 1);
-    });
-    return tracks;
+      return { track, tracks: Math.max(...track) + 1 };
+    };
+    const a = run(1), b = run(-1), best = b.tracks < a.tracks ? b : a;
+    hs.forEach((h, i) => { h.track = best.track[i]; });
+    return best.tracks;
   }
 
   // ============================================================
   // РАСКЛАДКА
   // ============================================================
-  function layout(state, GAPX) {
+  function layout(state, GAPX, opts = {}) {
     const { project, opItems, racks, netCabs, autoCabs } = state;
     const { effTarget, effNet, effAutoTarget } = makeResolvers(state);
     const perRow = clampPerRow(project.blocksPerRow);
     const hasExternal = netCabs.some(c => c.external);
-    const titleH = project.subtitle ? 82 : 58;
 
     const colStep = BW + GAPX;
     const sidePad = Math.max(GAPX, hasExternal ? 84 : 0);
@@ -387,7 +432,11 @@
       // Узкий блок стоит по центру своей колонки: зазоры справа и слева равны.
       L.blocks.forEach(b => { b.x = L.startX + b.col * colStep + (BW - b.w) / 2; });
     });
-    const blk = {};
+    const titleLines = wrapText(project.title, (width - 2 * MARGIN) / 10.8);
+    const subtitleLines = wrapText(project.subtitle, (width - 2 * MARGIN) / 7.2);
+    const titleH = 58 + Math.max(0, titleLines.length - 1) * 22 +
+      (subtitleLines.length ? 24 + (subtitleLines.length - 1) * 16 : 0);
+    const blk = Object.create(null);
     levels.forEach(L => L.blocks.forEach(b => { blk[b.id] = b; }));
     const cx = b => b.x + b.w / 2;
     const firstNet = LV.srv.blocks.find(b => b.kind === 'net') || LV.srv.blocks[0] || null;
@@ -421,7 +470,7 @@
       if (b.item.rs485Cab) {
         const targetId = effAutoTarget(b.item.rs485Target, b.id);
         const target = blk[targetId];
-        const linkKey = target ? [b.id, target.id].sort().join('|') : null;
+        const linkKey = target ? JSON.stringify([b.id, target.id].sort()) : null;
         if (target && !rs485CabLinks.has(linkKey)) {
           rs485CabLinks.add(linkKey);
           conns.push({ src: b, tgt: target, color: COLORS['RS-485'], cabLink: true });
@@ -460,11 +509,23 @@
       outs.forEach((c, i) => { c.sx = cabLinkX(b, 'out', i, outs.length); });
     });
 
+    // При починке сдвигается только конец обычной связи, на половину шага
+    // выходов и к её собственному горизонтальному участку. Концы RS-485 неприкосновенны.
+    const nudged = (c, side, x, b) => {
+      const dx = !c.cabLink && opts.nudges && opts.nudges.get(connKey(c) + '|' + side);
+      return dx ? Math.min(b.x + b.w - 6, Math.max(b.x + 6, x + dx)) : x;
+    };
+    conns.forEach(c => { c.sx = nudged(c, 'out', c.sx, c.src); });
+
     // ---- подход от грани блока к полосе: прямой либо через межколоночный зазор ----
     const approach = (c, isSrc, otherX) => {
       const B = isSrc ? c.src : c.tgt, O = isSrc ? c.tgt : c.src;
       const edge = isSrc ? c.sEdge : c.tEdge;
-      const px = isSrc ? c.sx : c.tx;
+      const side = isSrc ? 'out' : 'in';
+      // У неприкосновенного конца RS-485 может появиться короткий ортогональный
+      // отвод вдоль грани. Сама точка на блоке при этом не меняется.
+      const edgeDx = c.cabLink && opts.edgeNudges && opts.edgeNudges.get(connKey(c) + '|' + side);
+      const px = (isSrc ? c.sx : c.tx) + (edgeDx || 0);
       const L = LV[B.level];
       let r0, r1; // ряды, которые пересекает вертикаль
       if (B.level === O.level) {
@@ -474,12 +535,12 @@
       else { r0 = 0; r1 = B.row - 1; }
       let len = 0, blocked = false;
       for (let r = r0; r <= r1; r++) { len++; if (L.rows[r].some(o => o.col === B.col)) blocked = true; }
-      if (!blocked) return { x: px, run: null, jog: null };
+      if (!blocked) return { x: px, run: null, jog: null, edge: !!edgeDx };
       const dir = otherX >= cx(B) ? 'R' : 'L';           // в какую сторону от блока уходим
       const g = dir === 'R' ? B.col + 1 : B.col;          // зазор g — между колонками g-1 и g
-      const run = { g, side: dir === 'R' ? 'L' : 'R', len, px, ax: cx(B) };
+      const run = { g, side: dir === 'R' ? 'L' : 'R', len, px, ax: cx(B), key: connKey(c) + '|' + side };
       (L.gapRuns[g] = L.gapRuns[g] || []).push(run);
-      return { x: px, run, jog: edge === 'bottom' ? L.bands[B.row] : L.bands[B.row - 1] };
+      return { x: px, run, edge: !!edgeDx, jog: edge === 'bottom' ? L.bands[B.row] : L.bands[B.row - 1] };
     };
     const proxyOf = a => a.run ? a.run.ax : a.x;
     const assignSlots = () => levels.forEach(L => Object.keys(L.gapRuns).forEach(k => {
@@ -489,6 +550,9 @@
       const Rs = runs.filter(r => r.side === 'R').sort((a, b) => a.len - b.len || b.px - a.px);
       Ls.forEach((r, i) => { r.ax = gl + SLOT_M + i * SLOT; });
       Rs.forEach((r, i) => { r.ax = gl + GAPX - SLOT_M - i * SLOT; });
+      // Последний шанс для вертикалей обхода: сдвигаем только внутреннюю линию,
+      // не концы связи. Зазор расширяется, чтобы сохранить поле до блока.
+      if (opts.gapNudges) runs.forEach(r => { r.ax += opts.gapNudges.get(r.key) || 0; });
     }));
 
     conns.forEach(c => { c.sApp = approach(c, true, cx(c.tgt)); });
@@ -512,12 +576,14 @@
         .sort((a, b2) => proxyOf(a.sApp) - proxyOf(b2.sApp));
       ins.forEach((c, i) => { c.tx = cabLinkX(b, 'in', i, ins.length); });
     });
+    conns.forEach(c => { c.tx = nudged(c, 'in', c.tx, c.tgt); });
     conns.forEach(c => { c.tApp = approach(c, false, proxyOf(c.sApp)); });
     assignSlots();
 
     let needGap = 0;
     levels.forEach(L => Object.values(L.gapRuns).forEach(runs => {
-      needGap = Math.max(needGap, 2 * SLOT_M + (runs.length - 1) * SLOT);
+      const extra = opts.gapNudges ? Math.max(0, ...runs.map(r => Math.abs(opts.gapNudges.get(r.key) || 0))) : 0;
+      needGap = Math.max(needGap, 2 * SLOT_M + (runs.length - 1) * SLOT + extra);
     }));
 
     // ---- горизонтальные участки → полосы ----
@@ -542,7 +608,7 @@
       }
     });
     const allBands = [C1, C2, ...levels.flatMap(L => L.bands)];
-    allBands.forEach(b => { b.tracks = routeBand(b.hs); });
+    allBands.forEach(b => { b.tracks = routeBand(b.hs, { hard: !!opts.hard }); });
 
     // ---- вертикальная раскладка ----
     const bandH = (b) => {
@@ -575,9 +641,11 @@
       c.ty = c.tEdge === 'top' ? T.y : T.y + T.h;
       const sX = proxyOf(c.sApp), tX = proxyOf(c.tApp);
       const pts = [[c.sx, c.sy]];
+      if (c.sApp.edge) pts.push([sX, c.sy]);
       if (c.sApp.run) { const jy = trackY(c.sApp.jog, c.sJog.track); pts.push([c.sx, jy], [sX, jy]); }
       const my = trackY(c.band, c.main.track); pts.push([sX, my], [tX, my]);
       if (c.tApp.run) { const jy = trackY(c.tApp.jog, c.tJog.track); pts.push([tX, jy], [c.tx, jy]); }
+      if (c.tApp.edge) pts.push([tX, c.ty]);
       pts.push([c.tx, c.ty]);
       c.pts = pts.filter((p, i) => i === 0 || Math.abs(p[0] - pts[i - 1][0]) > 0.01 || Math.abs(p[1] - pts[i - 1][1]) > 0.01);
     });
@@ -593,7 +661,110 @@
       };
     });
 
-    return { width, titleH, LV, levels, conns, C1, C2, blk, ext, needGap, bottom: y };
+    return { width, titleH, titleLines, subtitleLines, LV, levels, conns, C1, C2, blk, ext, needGap, bottom: y };
+  }
+
+  const connKey = c => JSON.stringify([c.src.id, c.tgt.id]);
+
+  // Совпавшие отрезки ищем независимо от раздачи каналов. Оракул геометрии тестов
+  // живёт отдельно: исправление не должно подменять проверку собственных результатов.
+  function lineClashes(conns) {
+    const segs = [];
+    conns.forEach(c => c.pts.forEach((p, k) => {
+      const q = c.pts[k + 1];
+      if (!q || Math.hypot(p[0] - q[0], p[1] - q[1]) <= 0.01) return;
+      const horizontal = Math.abs(p[1] - q[1]) < 0.01;
+      segs.push({ c, k, horizontal, fixed: horizontal ? p[1] : p[0],
+        lo: horizontal ? Math.min(p[0], q[0]) : Math.min(p[1], q[1]),
+        hi: horizontal ? Math.max(p[0], q[0]) : Math.max(p[1], q[1]) });
+    }));
+    const out = [];
+    for (let i = 0; i < segs.length; i++) for (let j = i + 1; j < segs.length; j++) {
+      const A = segs[i], B = segs[j];
+      if (A.c !== B.c && A.horizontal === B.horizontal && Math.abs(A.fixed - B.fixed) < 0.05 &&
+          Math.min(A.hi, B.hi) - Math.max(A.lo, B.lo) > 1.5) out.push([A, B]);
+    }
+    return out;
+  }
+  const NUDGE = EXIT_STEP / 2;
+  function pickNudge(pair, nudges) {
+    if (pair[0].horizontal) return null;
+    const end = s => {
+      const last = s.k === s.c.pts.length - 2, first = s.k === 0;
+      if (s.c.cabLink || (!last && !first)) return null;
+      const key = connKey(s.c) + (last ? '|in' : '|out');
+      if (nudges.has(key)) return null; // повторный сдвиг мог бы вернуть старое наложение
+      const near = s.c.pts[last ? s.k - 1 : s.k + 2];
+      return { key, dx: (near && near[0] < s.fixed ? -1 : 1) * NUDGE, last };
+    };
+    const ends = pair.map(end).filter(Boolean);
+    return ends.find(e => e.last) || ends[0] || null;
+  }
+  // Обходы разных уровней могут попасть в одну линию даже после разноса концов.
+  function pickGapNudge(pair, nudges) {
+    if (pair[0].horizontal) return null;
+    for (const s of pair) {
+      for (const [app, side] of [[s.c.sApp, 'out'], [s.c.tApp, 'in']]) {
+        if (!app.run || Math.abs(app.run.ax - s.fixed) >= 0.05) continue;
+        const key = connKey(s.c) + '|' + side;
+        if (!nudges.has(key)) return { key, dx: (app.run.side === 'L' ? 1 : -1) * SLOT };
+      }
+    }
+    return null;
+  }
+  function pickEdgeNudge(pair, nudges) {
+    if (pair[0].horizontal) return null;
+    for (const s of pair) {
+      if (!s.c.cabLink) continue;
+      for (const [app, side, edgeX] of [[s.c.sApp, 'out', s.c.sx], [s.c.tApp, 'in', s.c.tx]]) {
+        if (app.run || Math.abs(app.x - s.fixed) >= 0.05) continue;
+        const key = connKey(s.c) + '|' + side;
+        if (nudges.has(key)) continue;
+        const otherX = side === 'out' ? s.c.tx : s.c.sx;
+        const b = side === 'out' ? s.c.src : s.c.tgt;
+        const dx = (otherX < edgeX ? -1 : 1) * NUDGE;
+        if (edgeX + dx > b.x + 6 && edgeX + dx < b.x + b.w - 6) return { key, dx };
+      }
+    }
+    return null;
+  }
+  function fitGap(state, opts) {
+    let model, gapx = GAP_MIN;
+    for (let i = 0; i < 4; i++) {
+      model = layout(state, gapx, opts);
+      if (model.needGap <= gapx) break;
+      gapx = model.needGap;
+    }
+    return model;
+  }
+  // Первый проход начинает с геометрии backup. Далее сдвигаем концы совпавших
+  // вертикалей; затем строгие ограничения каналов, внутренние линии обходов и,
+  // только для RS-485, ортогональный отвод без сдвига конца на блоке.
+  // Из проходов с наименьшим числом наложений выбираем самый ранний.
+  function layoutWithRepair(state) {
+    const opts = { nudges: new Map(), gapNudges: new Map(), edgeNudges: new Map(), hard: false };
+    let best = null;
+    for (let round = 0; round < 10; round++) {
+      const model = fitGap(state, opts), clashes = lineClashes(model.conns);
+      if (!best || clashes.length < best.n) best = { model, n: clashes.length };
+      if (!clashes.length) break;
+      let changed = false;
+      if (round < 4) clashes.forEach(pair => {
+        const nudge = pickNudge(pair, opts.nudges);
+        if (nudge) { opts.nudges.set(nudge.key, nudge.dx); changed = true; }
+      });
+      if (!changed && !opts.hard) { opts.hard = true; changed = true; }
+      if (!changed) clashes.forEach(pair => {
+        const nudge = pickGapNudge(pair, opts.gapNudges);
+        if (nudge) { opts.gapNudges.set(nudge.key, nudge.dx); changed = true; }
+      });
+      if (!changed) clashes.forEach(pair => {
+        const nudge = pickEdgeNudge(pair, opts.edgeNudges);
+        if (nudge) { opts.edgeNudges.set(nudge.key, nudge.dx); changed = true; }
+      });
+      if (!changed) break;
+    }
+    return best.model;
   }
 
   // ---------- Описания блоков ----------
@@ -627,13 +798,8 @@
   function buildScheme(state) {
     const { project, autoCabs, netCabs } = state;
 
-    // Ширина межколоночного зазора подбирается под число вертикалей в нём.
-    let M = null, gapx = GAP_MIN;
-    for (let i = 0; i < 4; i++) {
-      M = layout(state, gapx);
-      if (M.needGap <= gapx) break;
-      gapx = M.needGap;
-    }
+    // Подбор зазора и починка совпавших вертикалей используют одну модель.
+    const M = layoutWithRepair(state);
     const { width, LV, levels, conns, ext } = M;
     const levelX = MARGIN, levelW = width - 2 * MARGIN;
 
@@ -690,13 +856,14 @@
     };
 
     // ---- примечания ----
-    const noteLines = project.showNotes ? String(project.notesText || '').split('\n').filter(Boolean) : [];
+    const noteLines = project.showNotes ? wrapText(project.notesText, levelW / 6) : [];
     const notesY = legend.y + legend.h + 18;
-    const notes = noteLines.length ? { x: levelX, y: notesY, lines: noteLines } : null;
+    const notes = noteLines.length ? { x: levelX, y: notesY, w: levelW, lines: noteLines } : null;
     const height = notesY + (noteLines.length ? 20 + noteLines.length * 16 : 0) + 24;
 
     return {
       width, height, title: project.title, subtitle: project.subtitle, fileName: fileNameOf(project),
+      titleLines: M.titleLines, subtitleLines: M.subtitleLines,
       rooms, blocks, conns, ext, signals, legend, notes,
     };
   }
@@ -716,8 +883,10 @@
   function toSvg(m) {
     const out = [];
     out.push(el('rect', { x: 0, y: 0, width: m.width, height: m.height, fill: '#ffffff' }));
-    out.push(txt({ x: m.width / 2, y: 30, 'text-anchor': 'middle', 'font-size': 18, 'font-weight': 'bold', fill: '#111827' }, m.title));
-    if (m.subtitle) out.push(txt({ x: m.width / 2, y: 52, 'text-anchor': 'middle', 'font-size': 12, fill: '#6b7280' }, m.subtitle));
+    m.titleLines.forEach((line, i) => out.push(txt({ x: m.width / 2, y: 30 + i * 22,
+      'text-anchor': 'middle', 'font-size': 18, 'font-weight': 'bold', fill: '#111827' }, line)));
+    m.subtitleLines.forEach((line, i) => out.push(txt({ x: m.width / 2,
+      y: 52 + (m.titleLines.length - 1) * 22 + i * 16, 'text-anchor': 'middle', 'font-size': 12, fill: '#6b7280' }, line)));
 
     // помещения
     m.rooms.forEach(r => out.push(el('rect', {
@@ -757,7 +926,8 @@
     m.signals.forEach(s => out.push(el('g', {}, [
       el('line', { x1: s.x, y1: s.y1, x2: s.x, y2: s.y2 - 6, stroke: s.color, 'stroke-width': 1.7 }),
       el('polygon', { points: `${s.x},${s.y2} ${s.x - 4},${s.y2 - 7} ${s.x + 4},${s.y2 - 7}`, fill: s.color }),
-      txt({ x: s.x, y: s.y2 + 13, 'text-anchor': 'middle', 'font-size': 9, 'font-weight': 'bold', fill: s.color }, s.label),
+      txt({ x: s.x, y: s.y2 + 13, 'text-anchor': 'middle', 'font-size': 9, 'font-weight': 'bold', fill: s.color,
+        stroke: '#ffffff', 'stroke-width': 3, 'paint-order': 'stroke' }, s.label),
     ].join(''))));
 
     // легенда
@@ -797,14 +967,16 @@
     let eid = 0;
 
     const vtx = (id, value, x, y, w, h, style) =>
-      cells.push(`<mxCell id="${id}" value="${xesc(value)}" style="${style}" vertex="1" parent="1"><mxGeometry x="${R(x)}" y="${R(y)}" width="${R(w)}" height="${R(h)}" as="geometry"/></mxCell>`);
+      cells.push(`<mxCell id="${xesc(id)}" value="${xesc(value)}" style="${style}" vertex="1" parent="1"><mxGeometry x="${R(x)}" y="${R(y)}" width="${R(w)}" height="${R(h)}" as="geometry"/></mxCell>`);
     const edge = (value, style, attrs, geometry) =>
       cells.push(`<mxCell id="e${eid++}" value="${xesc(value)}" style="${style}" edge="1" parent="1"${attrs}><mxGeometry relative="1" as="geometry">${geometry}</mxGeometry></mxCell>`);
 
-    vtx('t1', `<b>${hesc(m.title)}</b>`, MARGIN, 8, m.width - 2 * MARGIN, 26,
-      'text;html=1;align=center;verticalAlign=middle;fontSize=18;fontColor=#111827;');
-    if (m.subtitle) vtx('t2', hesc(m.subtitle), MARGIN, 38, m.width - 2 * MARGIN, 18,
-      'text;html=1;align=center;verticalAlign=middle;fontSize=12;fontColor=#6b7280;');
+    vtx('t1', `<b>${m.titleLines.map(hesc).join('<br>')}</b>`, MARGIN, 8,
+      m.width - 2 * MARGIN, 26 + Math.max(0, m.titleLines.length - 1) * 22,
+      'text;html=1;whiteSpace=wrap;align=center;verticalAlign=middle;fontSize=18;fontColor=#111827;');
+    if (m.subtitleLines.length) vtx('t2', m.subtitleLines.map(hesc).join('<br>'), MARGIN,
+      38 + Math.max(0, m.titleLines.length - 1) * 22, m.width - 2 * MARGIN, 18 + (m.subtitleLines.length - 1) * 16,
+      'text;html=1;whiteSpace=wrap;align=center;verticalAlign=middle;fontSize=12;fontColor=#6b7280;');
 
     const roomStyle = f => `rounded=1;dashed=1;dashPattern=6 4;fillColor=${f};strokeColor=#94a3b8;verticalAlign=top;align=left;spacingLeft=10;spacingTop=2;fontSize=12;fontStyle=1;fontColor=#475569;html=1;`;
     m.rooms.forEach(r => vtx(r.id, hesc(r.name), r.x, r.y, r.w, r.h, roomStyle(r.fill)));
@@ -820,19 +992,19 @@
       const entryX = ((c.tx - T.x) / T.w).toFixed(3), entryY = c.tEdge === 'top' ? 0 : 1;
       const inner = c.pts.slice(1, -1).map(p => `<mxPoint x="${R(p[0])}" y="${R(p[1])}"/>`).join('');
       edge('', `edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeWidth=2;strokeColor=${c.color};exitX=${exitX};exitY=${exitY};exitDx=0;exitDy=0;entryX=${entryX};entryY=${entryY};entryDx=0;entryDy=0;`,
-        ` source="b_${S.id}" target="b_${T.id}"`, `<Array as="points">${inner}</Array>`);
+        ` source="b_${xesc(S.id)}" target="b_${xesc(T.id)}"`, `<Array as="points">${inner}</Array>`);
     });
 
     const optic = COLORS['Оптика'];
     m.ext.forEach(e => {
       const exitY = ((e.y - e.b.y) / e.b.h).toFixed(3);
       edge(e.label ? 'Внешняя связь' : '', `endArrow=block;endFill=1;dashed=1;dashPattern=7 4;html=1;strokeWidth=2;strokeColor=${optic};fontColor=${optic};fontSize=9;verticalAlign=bottom;exitX=1;exitY=${exitY};exitDx=0;exitDy=0;`,
-        ` source="b_${e.b.id}"`, `<mxPoint x="${R(e.x2)}" y="${R(e.y)}" as="targetPoint"/>`);
+        ` source="b_${xesc(e.b.id)}"`, `<mxPoint x="${R(e.x2)}" y="${R(e.y)}" as="targetPoint"/>`);
     });
 
     m.signals.forEach(s => {
-      edge(s.label, `endArrow=block;endFill=1;html=1;strokeWidth=2;strokeColor=${s.color};fontColor=${s.color};fontSize=9;fontStyle=1;verticalAlign=bottom;exitX=${s.exitX.toFixed(3)};exitY=1;exitDx=0;exitDy=0;`,
-        ` source="b_${s.block.id}"`, `<mxPoint x="${R(s.x)}" y="${R(s.y2)}" as="targetPoint"/>`);
+      edge(s.label, `endArrow=block;endFill=1;html=1;strokeWidth=2;strokeColor=${s.color};fontColor=${s.color};fontSize=9;fontStyle=1;labelBackgroundColor=#ffffff;verticalAlign=bottom;exitX=${s.exitX.toFixed(3)};exitY=1;exitDx=0;exitDy=0;`,
+        ` source="b_${xesc(s.block.id)}"`, `<mxPoint x="${R(s.x)}" y="${R(s.y2)}" as="targetPoint"/>`);
     });
 
     const lg = m.legend;
@@ -845,8 +1017,8 @@
 
     if (m.notes) {
       const val = '<b>Примечания:</b>' + m.notes.lines.map(t => `<div>${hesc(t)}</div>`).join('');
-      vtx('notes', val, m.notes.x, m.notes.y, lg.w, 20 + m.notes.lines.length * 16,
-        'text;html=1;align=left;verticalAlign=top;fontSize=10;fontColor=#4b5563;');
+      vtx('notes', val, m.notes.x, m.notes.y, m.notes.w, 20 + m.notes.lines.length * 16,
+        'text;html=1;whiteSpace=wrap;align=left;verticalAlign=top;fontSize=10;fontColor=#4b5563;');
     }
 
     return `<mxfile host="app.diagrams.net" agent="scheme-generator" version="1.1"><diagram id="d1" name="Схема"><mxGraphModel dx="800" dy="600" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="${R(m.width)}" pageHeight="${R(m.height)}" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/>${cells.join('')}</root></mxGraphModel></diagram></mxfile>`;
@@ -854,11 +1026,11 @@
 
   return {
     COLORS, NAME_BY_COLOR, OP_TYPES, OP_LINKS, AUTO_UPLINKS, AUTO_UPLINK_OPTIONS, UPLINK_NONE, KVM_PANEL_ID,
-    PROJECT_DEFAULTS, ITEM_DEFAULTS, FORMAT, FORMAT_VERSION, STORAGE_KEY,
-    PER_ROW_MAX, RASTER_SCALE, RASTER_MAX_PIXELS,
-    uid, fit, pad2, clampPerRow, rasterScale, signalLabel, signalsOf, fileNameOf, routeBand,
+    PROJECT_DEFAULTS, ITEM_DEFAULTS, FORMAT, FORMAT_VERSION, STORAGE_KEY, STORAGE_BACKUP_KEY,
+    COUNT_MAX, PER_ROW_MAX, RASTER_SCALE, RASTER_MAX_PIXELS,
+    uid, fit, wrapText, pad2, toCount, clampPerRow, rasterScale, signalLabel, signalsOf, fileNameOf, routeBand,
     createDefaultState, newOpItem, newRack, newNetCab, newAutoCab,
     serializeState, normalizeState, parseState, makeResolvers,
-    buildScheme, toSvg, toDrawio,
+    cabLinkX, buildScheme, toSvg, toDrawio,
   };
 });
