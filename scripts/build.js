@@ -21,8 +21,11 @@ const BANNER = [
 
 const read = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8').replace(/\r\n/g, '\n');
 
-// Внутри <script> последовательность </script> недопустима даже внутри строки.
-const inlineCode = (code) => code.replace(/<\/script>/gi, '<\\/script>');
+// Встроенный код не должен закрыть свой блок раньше времени: «</script» и «</style»
+// в любом регистре экранируются, как и «<!--» (с ним парсер HTML переходит в режим,
+// где следующий «</script>» уже не закрывает блок).
+const inlineCode = (code) => code.replace(/<\/(script)/gi, '<\\/$1').replace(/<!--/g, '<\\!--');
+const inlineCss = (css) => css.replace(/<\/(style)/gi, '<\\/$1');
 
 // dev: в сборку попадают development-сборки React и ReactDOM — их использует
 // tests/app.test.js, чтобы поймать предупреждения React о неверной разметке.
@@ -35,7 +38,7 @@ function build({ dev = false } = {}) {
 
   let html = read(SHELL);
   html = html.replace(/[ \t]*<link rel="stylesheet" href="([^"]+)">[ \t]*\n?/g,
-    (m, href) => `  <style>\n${read(href).trim()}\n  </style>\n`);
+    (m, href) => `  <style>\n${inlineCss(read(href).trim())}\n  </style>\n`);
   html = html.replace(/[ \t]*<script src="([^"]+)"><\/script>[ \t]*\n?/g,
     (m, src) => `  <script>\n${inlineCode(read(devFile(src)).trim())}\n  </script>\n`);
 
@@ -52,4 +55,4 @@ if (require.main === module) {
   console.log(`${OUT}: ${kb} КБ, зависимостей нет${dev ? ' (development-сборка React)' : ''}`);
 }
 
-module.exports = { build, OUT, SHELL, BANNER };
+module.exports = { build, inlineCode, inlineCss, OUT, SHELL, BANNER };

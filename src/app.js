@@ -11,14 +11,18 @@
   const C = window.SchemeCore;
 
   // ---------- Состояние проекта ----------
+  // Нечитаемое сохранение (повреждено или записано более новой версией страницы) не
+  // затираем: копия откладывается под STORAGE_BACKUP_KEY, пользователь видит предупреждение.
   function loadInitialState() {
-    try {
-      const saved = window.localStorage.getItem(C.STORAGE_KEY);
-      if (saved) return C.parseState(saved);
-    } catch (e) {
+    let saved = null;
+    try { saved = window.localStorage.getItem(C.STORAGE_KEY); } catch (e) { /* хранилище недоступно */ }
+    if (!saved) return { state: C.createDefaultState(), unreadable: null };
+    try { return { state: C.parseState(saved), unreadable: null }; }
+    catch (e) {
       console.warn('Не удалось восстановить сохранённый проект:', e);
+      try { window.localStorage.setItem(C.STORAGE_BACKUP_KEY, saved); } catch (_) { /* нет места */ }
+      return { state: C.createDefaultState(), unreadable: { text: saved, reason: e.message } };
     }
-    return C.createDefaultState();
   }
 
   function saveToStorage(state) {
@@ -61,7 +65,9 @@
 
   function SchemeGenerator() {
     const [tab, setTab] = useState('project');
-    const [state, setState] = useState(loadInitialState);
+    const [boot] = useState(loadInitialState);
+    const [state, setState] = useState(boot.state);
+    const [unreadable, setUnreadable] = useState(boot.unreadable);
     const fileInput = useRef(null);
     const { project, opItems, racks, netCabs, autoCabs } = state;
 
@@ -88,18 +94,22 @@
       const ext = type === 'image/jpeg' ? '.jpg' : '.png';
       const fail = (why) => alert('Не удалось сохранить ' + ext.slice(1).toUpperCase() + ': ' + why + ' Попробуйте экспорт в SVG.');
       const img = new Image();
+      // Всё тело onload — в try: сбой до toBlob (например, getContext вернул null)
+      // иначе прошёл бы молча, без обещанного сообщения.
       img.onload = () => {
-        const scale = C.rasterScale(model.width, model.height);
-        const c = document.createElement('canvas');
-        c.width = Math.round(model.width * scale); c.height = Math.round(model.height * scale);
-        const ctx = c.getContext('2d');
-        ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, c.width, c.height);
-        ctx.drawImage(img, 0, 0, c.width, c.height);
-        const done = (blob) => blob
-          ? download(blob, fname + ext)
-          : fail('браузер не справился с размером листа.');
-        try { c.toBlob(done, type, 0.95); }
-        catch (err) { fail(err.message + '.'); }
+        try {
+          const scale = C.rasterScale(model.width, model.height);
+          const c = document.createElement('canvas');
+          c.width = Math.round(model.width * scale); c.height = Math.round(model.height * scale);
+          const ctx = c.getContext('2d');
+          if (!ctx) { fail('браузер не выделил память под картинку.'); return; }
+          ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, c.width, c.height);
+          ctx.drawImage(img, 0, 0, c.width, c.height);
+          const done = (blob) => blob
+            ? download(blob, fname + ext)
+            : fail('браузер не справился с размером листа.');
+          c.toBlob(done, type, 0.95);
+        } catch (err) { fail(err.message + '.'); }
       };
       img.onerror = () => fail('браузер не смог разобрать схему.');
       img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
@@ -117,6 +127,7 @@
         try { setState(C.parseState(String(reader.result))); }
         catch (err) { alert('Не удалось открыть проект: ' + err.message); }
       };
+      reader.onerror = () => alert('Не удалось прочитать файл: ' + (reader.error ? reader.error.message : 'ошибка чтения'));
       reader.readAsText(file);
     };
     const resetProject = () => {
@@ -222,7 +233,7 @@
           ${racks.map(r => html`
             <div key=${r.id} className="grid grid-cols-12 gap-2 items-center mb-1">
               <div className="col-span-4"><${Inp} value=${r.name} onChange=${e => updRack(r.id, 'name', e.target.value)} /></div>
-              <div><${Num} value=${r.servers} onChange=${e => updRack(r.id, 'servers', Number(e.target.value))} /></div>
+              <div><${Num} value=${r.servers} onChange=${e => updRack(r.id, 'servers', C.toCount(e.target.value))} /></div>
               <div className="col-span-3">${netSelect(effNet(r.netTarget), e => updRack(r.id, 'netTarget', e.target.value))}</div>
               <div><${Chk} checked=${r.kvm} title="Стойка подключается к щиту КВМ-удлинителей (вкладка «Операторная»)"
                 onChange=${e => updRack(r.id, 'kvm', e.target.checked)} /></div>
@@ -243,9 +254,9 @@
           ${netCabs.map(c => html`
             <div key=${c.id} className="grid grid-cols-12 gap-2 items-center mb-1">
               <div className="col-span-4"><${Inp} value=${c.name} onChange=${e => updNet(c.id, 'name', e.target.value)} /></div>
-              <div><${Num} value=${c.switches} onChange=${e => updNet(c.id, 'switches', Number(e.target.value))} /></div>
-              <div><${Num} value=${c.fw} onChange=${e => updNet(c.id, 'fw', Number(e.target.value))} /></div>
-              <div className="col-span-2"><${Num} value=${c.cross} onChange=${e => updNet(c.id, 'cross', Number(e.target.value))} /></div>
+              <div><${Num} value=${c.switches} onChange=${e => updNet(c.id, 'switches', C.toCount(e.target.value))} /></div>
+              <div><${Num} value=${c.fw} onChange=${e => updNet(c.id, 'fw', C.toCount(e.target.value))} /></div>
+              <div className="col-span-2"><${Num} value=${c.cross} onChange=${e => updNet(c.id, 'cross', C.toCount(e.target.value))} /></div>
               <div className="col-span-2"><${Chk} checked=${c.external} onChange=${e => updNet(c.id, 'external', e.target.checked)} /></div>
               <div><${Chk} checked=${c.ups} onChange=${e => updNet(c.id, 'ups', e.target.checked)} /></div>
               <${DelBtn} onClick=${() => del('netCabs')(c.id)} />
@@ -268,7 +279,7 @@
         ${autoCabs.map(c => html`
           <div key=${c.id} className="flex items-start gap-2 mb-1">
             <div className="w-40 shrink-0"><${Inp} value=${c.name} onChange=${e => updAuto(c.id, 'name', e.target.value)} /></div>
-            <div className="w-16 shrink-0"><${Num} value=${c.ctrls} onChange=${e => updAuto(c.id, 'ctrls', Number(e.target.value))} /></div>
+            <div className="w-16 shrink-0"><${Num} value=${c.ctrls} onChange=${e => updAuto(c.id, 'ctrls', C.toCount(e.target.value))} /></div>
             <div className="w-28 shrink-0">
               <${Sel} value=${c.uplink} onChange=${e => updAuto(c.id, 'uplink', e.target.value)}>${options(C.AUTO_UPLINK_OPTIONS)}<//>
             </div>
@@ -281,7 +292,7 @@
               <div key=${f} className="w-8 shrink-0 flex flex-col items-start gap-1 pt-1">
                 <${Chk} checked=${c[f]} onChange=${e => updAuto(c.id, f, e.target.checked)} />
                 ${project.showSignalCounts && c[f] && html`
-                  <input type="number" min="0" value=${c[nf]} onChange=${e => updAuto(c.id, nf, Number(e.target.value))}
+                  <input type="number" min="0" value=${c[nf]} onChange=${e => updAuto(c.id, nf, C.toCount(e.target.value))}
                     className="border border-gray-300 rounded px-1 py-0.5 text-xs w-12" />`}
               </div>`)}
             <div className="w-16 shrink-0 pt-1"><${Chk} checked=${c.rs485} onChange=${e => updAuto(c.id, 'rs485', e.target.checked)} /></div>
@@ -300,10 +311,19 @@
 
     const TAB_VIEWS = { project: projectTab, op: opTab, srv: srvTab, auto: autoTab };
 
+    // Сохранение в браузере не открылось: показываем причину и даём скачать копию.
+    const storageNotice = () => unreadable && html`
+      <div data-testid="storage-notice" className="flex flex-wrap items-center gap-2 mb-4 p-3 rounded border border-gray-300 bg-gray-50 text-sm text-amber-700">
+        <span>Сохранённый в браузере проект не открылся: ${unreadable.reason} Показан пример, копия старых данных отложена.</span>
+        <button onClick=${() => download(new Blob([unreadable.text], { type: 'application/json' }), 'unreadable_project.json')} className=${BTN_FILE}>Скачать копию</button>
+        <button onClick=${() => setUnreadable(null)} className=${BTN_FILE}>Скрыть</button>
+      </div>`;
+
     return html`
       <div className="p-4 bg-gray-100 min-h-screen font-sans">
         <div className="max-w-6xl mx-auto space-y-4">
           <div className="bg-white rounded-lg shadow p-4">
+            ${storageNotice()}
             <div className="flex flex-wrap gap-2 border-b border-gray-200 pb-2 mb-4">
               ${TABS.map(([k, l]) => html`
                 <button key=${k} onClick=${() => setTab(k)}

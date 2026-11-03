@@ -55,6 +55,13 @@
     const n = Math.floor(Number(value));
     return Number.isFinite(n) ? Math.min(PER_ROW_MAX, Math.max(1, n)) : 1;
   };
+  // Количества (серверов, коммутаторов, сигналов…) — целые неотрицательные числа.
+  // Верхний предел отсекает мусор из чужих файлов вроде 1e9 в подписи схемы.
+  const COUNT_MAX = 99999;
+  const toCount = (value, fallback = 0) => {
+    const n = Math.floor(Number(value));
+    return Number.isFinite(n) ? Math.min(COUNT_MAX, Math.max(0, n)) : fallback;
+  };
   const signalsOf = (c) => {
     const s = [];
     if (c.di) s.push({ k: 'DI', n: c.diN });
@@ -203,6 +210,8 @@
   const FORMAT = 'structural-scheme';
   const FORMAT_VERSION = 1;
   const STORAGE_KEY = 'structural-scheme:project';
+  // Копия сохранения, которое не удалось прочитать: она откладывается рядом и не затирается.
+  const STORAGE_BACKUP_KEY = STORAGE_KEY + ':unreadable';
 
   function serializeState(state) {
     const out = { format: FORMAT, version: FORMAT_VERSION, project: state.project };
@@ -242,6 +251,13 @@
       const list = Array.isArray(raw[k]) ? raw[k] : [];
       state[k] = list.filter(isPlainObject).map(item => {
         const it = pickKnown(item, ITEM_DEFAULTS[k]);
+        // Числовые поля элемента приводим к целым неотрицательным. Пустая строка
+        // остаётся пустой: так подпись сигнала не показывает количество (signalLabel).
+        Object.keys(ITEM_DEFAULTS[k]).forEach(f => {
+          const d = ITEM_DEFAULTS[k][f];
+          if (typeof d !== 'number') return;
+          it[f] = typeof it[f] === 'string' && it[f].trim() === '' ? '' : toCount(it[f], d);
+        });
         if (!it.id || seen.has(it.id)) it.id = uid();
         seen.add(it.id);
         return it;
@@ -281,11 +297,12 @@
   // Раздача каналов внутри одной горизонтальной полосы.
   // h: { x1, x2, top:[x...], bot:[x...] } — пролёт и абсциссы вертикалей, подходящих к нему сверху/снизу.
   // Строится граф «кто обязан быть выше кого», затем каналы раздаются без пересечений (где это возможно).
-  function routeBand(hs) {
+  function routeBand(hs, opts = {}) {
     const n = hs.length;
     hs.forEach(h => { h.track = -1; });
     if (!n) return 0;
     const above = hs.map(() => new Set()); // above[i] — пролёты, которые должны лежать ВЫШЕ i
+    const sameX = (a, b) => Math.abs(a - b) < 0.5;
     for (let i = 0; i < n; i++) {
       for (let j = 0; j < n; j++) {
         if (i === j) continue;
@@ -293,6 +310,10 @@
         const inside = x => x > A.x1 && x < A.x2;
         if (B.top.some(inside)) above[i].add(j); // вертикаль B сверху пересекает пролёт A → A ниже B
         if (B.bot.some(inside)) above[j].add(i); // вертикаль B снизу пересекает пролёт A → A выше B
+        // Жёсткая ступень (opts.hard): вертикаль уходит вниз с пролёта A и приходит
+        // сверху на ту же абсциссу к пролёту B — B обязан лежать выше A. Обычная
+        // проверка «внутри пролёта» строгая и такой случай пропускает.
+        if (opts.hard && B.top.some(x => A.bot.some(y => sameX(x, y)))) above[i].add(j);
       }
     }
     const placed = new Array(n).fill(false), order = [];
@@ -320,10 +341,33 @@
     return tracks;
   }
 
+  // Наложения вертикалей: два разных отрезка идут по одной абсциссе и перекрываются
+  // по высоте. Проверка ровно та же, что в tests/helpers.js (layoutProblems): тесты
+  // не должны знать о внутреннем механизме починки.
+  function verticalClashes(conns) {
+    const segs = [];
+    conns.forEach(c => c.pts.forEach((p, k) => {
+      const q = c.pts[k + 1];
+      if (q && Math.abs(p[0] - q[0]) < 0.01 && Math.abs(p[1] - q[1]) > 0.01) {
+        segs.push({ c, k, x: p[0], y1: Math.min(p[1], q[1]), y2: Math.max(p[1], q[1]) });
+      }
+    }));
+    const out = [];
+    for (let i = 0; i < segs.length; i++) {
+      for (let j = i + 1; j < segs.length; j++) {
+        const A = segs[i], B = segs[j];
+        if (A.c === B.c || Math.abs(A.x - B.x) > 0.05) continue;
+        if (Math.min(A.y2, B.y2) - Math.max(A.y1, B.y1) > 1.5) out.push([A, B]);
+      }
+    }
+    return out;
+  }
+
   // ============================================================
   // РАСКЛАДКА
   // ============================================================
-  function layout(state, GAPX) {
+  // opts.nudges — карта «связь|грань → сдвиг конца» для починки наложений (layoutWithRepair).
+  function layout(state, GAPX, opts = {}) {
     const { project, opItems, racks, netCabs, autoCabs } = state;
     const { effTarget, effNet, effAutoTarget } = makeResolvers(state);
     const perRow = clampPerRow(project.blocksPerRow);
@@ -452,6 +496,16 @@
       g.sort((a, b) => cx(a.tgt) - cx(b.tgt));
       g.forEach((c, i) => { c.sx = cx(c.src) + (i - (g.length - 1) / 2) * EXIT_STEP; });
     });
+    // Сдвиг конца связи на полшага (см. layoutWithRepair): конец остаётся на своей
+    // грани и не выходит за её пределы. Концы RS-485 между шкафами не двигаются.
+    const connKey = c => c.src.id + '>' + c.tgt.id;
+    const shiftEnd = (c, side, x, b) => {
+      const dx = opts.nudges && !c.cabLink && opts.nudges.get(connKey(c) + '|' + side);
+      if (!dx) return x;
+      return Math.min(b.x + b.w - 6, Math.max(b.x + 6, x + dx));
+    };
+    conns.forEach(c => { c.sx = shiftEnd(c, 'out', c.sx, c.src); });
+
     // RS-485 между шкафами выходит из нижней грани справа после всех стрелок
     // сигналов (см. cabLinkX), а не по центру блока.
     LV.auto.blocks.forEach(b => {
@@ -487,12 +541,26 @@
       const gl = L.startX + g * colStep - GAPX;
       const Ls = runs.filter(r => r.side === 'L').sort((a, b) => a.len - b.len || a.px - b.px);
       const Rs = runs.filter(r => r.side === 'R').sort((a, b) => a.len - b.len || b.px - a.px);
-      Ls.forEach((r, i) => { r.ax = gl + SLOT_M + i * SLOT; });
-      Rs.forEach((r, i) => { r.ax = gl + GAPX - SLOT_M - i * SLOT; });
+      const place = (r, x) => { r.ax = x; r.gl = gl; r.limit = GAPX; };
+      Ls.forEach((r, i) => place(r, gl + SLOT_M + i * SLOT));
+      Rs.forEach((r, i) => place(r, gl + GAPX - SLOT_M - i * SLOT));
     }));
 
+    // Сдвиг места в межколоночном зазоре (см. layoutWithRepair): вертикаль,
+    // идущая по зазору, переезжает на другое место того же зазора.
+    const applySlots = () => {
+      if (!opts.slots || !opts.slots.size) return;
+      conns.forEach(c => {
+        [['out', c.sApp], ['in', c.tApp]].forEach(([side, app]) => {
+          if (!app || !app.run) return;
+          const x = opts.slots.get(connKey(c) + '|slot:' + side);
+          if (x != null) app.run.ax = x;
+        });
+      });
+    };
     conns.forEach(c => { c.sApp = approach(c, true, cx(c.tgt)); });
     assignSlots();
+    applySlots();
 
     // ---- точки входа: U-образные слева, сквозные по x источника, U-образные справа ----
     groupBy(conns, c => c.tgt.id + '|' + c.tEdge).forEach(g => {
@@ -512,8 +580,10 @@
         .sort((a, b2) => proxyOf(a.sApp) - proxyOf(b2.sApp));
       ins.forEach((c, i) => { c.tx = cabLinkX(b, 'in', i, ins.length); });
     });
+    conns.forEach(c => { c.tx = shiftEnd(c, 'in', c.tx, c.tgt); });
     conns.forEach(c => { c.tApp = approach(c, false, proxyOf(c.sApp)); });
     assignSlots();
+    applySlots();
 
     let needGap = 0;
     levels.forEach(L => Object.values(L.gapRuns).forEach(runs => {
@@ -542,7 +612,19 @@
       }
     });
     const allBands = [C1, C2, ...levels.flatMap(L => L.bands)];
-    allBands.forEach(b => { b.tracks = routeBand(b.hs); });
+    allBands.forEach(b => { b.tracks = routeBand(b.hs, opts); });
+    // Переопределение канала пролёта (обмен каналами, см. layoutWithRepair).
+    if (opts.tracks && opts.tracks.size) {
+      conns.forEach(c => {
+        [['main', c.main], ['sout', c.sJog], ['tin', c.tJog]].forEach(([tag, h]) => {
+          if (!h) return;
+          const band = tag === 'main' ? c.band : (tag === 'sout' ? c.sApp.jog : c.tApp.jog);
+          const t = opts.tracks.get(connKey(c) + '|' + tag);
+          if (!band || t == null || t < 0 || t >= band.tracks) return;
+          h.track = t;
+        });
+      });
+    }
 
     // ---- вертикальная раскладка ----
     const bandH = (b) => {
@@ -596,6 +678,379 @@
     return { width, titleH, LV, levels, conns, C1, C2, blk, ext, needGap, bottom: y };
   }
 
+  // ---------- Починка наложений ----------
+  // Основа — трассировка backup: первый проход повторяет её без единого изменения.
+  // Дальше найденные наложения разводятся тремя заходами (см. layoutWithRepair):
+  //   • перебор ходов по первому наложению — сдвиг конца связи на полшага по грани
+  //     блока, переезд вертикали на другое место зазора, другой канал полосы;
+  //   • мелкие места в зазоре, когда все обычные заняты вертикалями других уровней;
+  //   • прямой сдвиг слипшейся вертикали в готовом маршруте (fixVerticals).
+  // Сетка полос (число каналов и ширина листа) — это опорная геометрия из backup:
+  // ход, который её меняет, не принимается, иначе лист уезжает целиком и опорные
+  // маршруты перестают совпадать. Последний заход пересчёт не запускает вовсе,
+  // поэтому остальные линии от него не двигаются.
+  const NUDGE = EXIT_STEP / 2;
+  const spanTrackY = (band, t) => band.y + band.reserved + band.pad + t * LSTEP;
+
+  // Кандидат на сдвиг — конец связи, лежащий на грани блока. Вход предпочитаем
+  // выходу: выходы упорядочены по положению целей, входы распределены ровно.
+  // Концы RS-485 между шкафами не двигаем: их положение задано стрелками сигналов.
+  function nudgeCandidates(pair, used, conns, allEnds) {
+    const ends = [];
+    pair.forEach(seg => {
+      const pts = seg.c.pts;
+      const last = seg.k === pts.length - 2, first = seg.k === 0;
+      if (!last && !first) return;
+      if (seg.c.cabLink) return;
+      const key = seg.c.src.id + '>' + seg.c.tgt.id + '|' + (last ? 'in' : 'out');
+      ends.push({ seg, key, last });
+    });
+    if (!ends.length) return [];
+    ends.sort((a, b) => Number(b.last) - Number(a.last));
+    const out = [];
+    (allEnds ? ends : ends.slice(0, 1)).forEach(({ seg, key }) => {
+      const free = x => !conns.some(c => c !== seg.c && c.pts.some((p, k) => {
+        const q = c.pts[k + 1];
+        if (!q || Math.abs(p[0] - q[0]) >= 0.01 || Math.abs(p[0] - x) >= 0.05) return false;
+        const y1 = Math.min(p[1], q[1]), y2 = Math.max(p[1], q[1]);
+        return Math.min(y2, seg.y2) - Math.max(y1, seg.y1) > 1.5;
+      }));
+      const pts = seg.c.pts;
+      const near = seg.k === pts.length - 2 ? pts[seg.k - 1] : pts[seg.k + 2];
+      const toward = near && Math.abs(near[0] - seg.x) > 0.01 ? Math.sign(near[0] - seg.x) : 0;
+      const dirs = toward ? [toward, -toward] : [1, -1];
+      dirs.map(d => d * NUDGE).filter(d => free(seg.x + d)).forEach(dx => out.push({
+        id: key + '=' + dx,
+        changes: [['nudges', key, dx]],
+      }));
+    });
+    return out;
+  }
+
+  // Кандидат на переезд — вертикаль, идущая по межколоночному зазору: её абсцисса
+  // это место в зазоре, а не грань блока. Места раздаются отдельно по уровням,
+  // поэтому вертикали разных уровней могут встать на одно место и слипнуться.
+  function slotCandidates(pair, used, conns, fine) {
+    const cands = [];
+    pair.forEach(seg => {
+      if (seg.c.cabLink) return;
+      for (const side of ['out', 'in']) {
+        const app = side === 'out' ? seg.c.sApp : seg.c.tApp;
+        if (!app || !app.run || Math.abs(app.run.ax - seg.x) > 0.05) continue;
+        cands.push({ seg, key: seg.c.src.id + '>' + seg.c.tgt.id + '|slot:' + side, run: app.run });
+      }
+    });
+    if (!cands.length) return [];
+    const out = [];
+    (fine ? cands : cands.slice(0, 1)).forEach(({ seg, key, run }) => {
+      const { gl, limit } = run;
+      const xs = [];
+      for (let i = 0; i < 4; i++) xs.push(gl + SLOT_M + i * SLOT, gl + limit - SLOT_M - i * SLOT);
+      // Соседние места в зазоре заняты вертикалями других уровней: во втором
+      // заходе разрешаем встать рядом с текущим местом, с шагом в пару пикселей.
+      if (fine) [3, -3, 5, -5, 6, -6].forEach(d => xs.push(run.ax + d));
+      const free = x => x > gl + 2 && x < gl + limit - 2 && !conns.some(c => c !== seg.c && c.pts.some((p, k) => {
+        const q = c.pts[k + 1];
+        if (!q || Math.abs(p[0] - q[0]) >= 0.01 || Math.abs(p[0] - x) >= 0.05) return false;
+        const y1 = Math.min(p[1], q[1]), y2 = Math.max(p[1], q[1]);
+        return Math.min(y2, seg.y2) - Math.max(y1, seg.y1) > 1.5;
+      }));
+      [...new Set(xs)].filter(x => Math.abs(x - seg.x) > 0.5 && free(x))
+        .sort((a, b) => Math.abs(a - seg.x) - Math.abs(b - seg.x))
+        .forEach(x => out.push({ id: key + '=' + x, changes: [['slots', key, x]] }));
+    });
+    return out;
+  }
+
+  // Пролёт, которому принадлежит вертикаль: внутренний конец вертикали лежит
+  // на канале полосы (другой конец — на грани блока).
+  function spanOf(seg) {
+    const c = seg.c;
+    const list = [
+      [c.main, c.band, 'main'],
+      [c.sJog, c.sApp && c.sApp.jog, 'sout'],
+      [c.tJog, c.tApp && c.tApp.jog, 'tin'],
+    ];
+    for (const [h, band, tag] of list) {
+      if (!h || !band || band.tracks < 1) continue;
+      if (seg.x < h.x1 - 0.5 || seg.x > h.x2 + 0.5) continue;
+      const y = spanTrackY(band, h.track);
+      if (Math.abs(y - seg.y1) < 0.5 || Math.abs(y - seg.y2) < 0.5) {
+        return { key: c.src.id + '>' + c.tgt.id + '|' + tag, band, span: h, track: h.track };
+      }
+    }
+    return null;
+  }
+
+  // Перестановка канала: одна из двух слипшихся вертикалей переезжает на другой
+  // канал той же полосы. Высота полосы при этом не меняется, поэтому остальные
+  // линии чертежа остаются на месте; пересечения с горизонталями допустимы.
+  function trackCandidates(pair, used) {
+    const out = [];
+    pair.forEach(seg => {
+      const s = spanOf(seg);
+      if (!s) return;
+      // Канал, на котором уже лежит перекрывающийся пролёт, не годится: получилась
+      // бы слипшаяся горизонталь вместо слипшейся вертикали.
+      const busy = (t, self) => s.band.hs.some(h => h !== self && h.track === t
+        && !(h.x2 + 4 < self.x1 || h.x1 > self.x2 + 4));
+      const self = s.span;
+      for (let t = 0; t < s.band.tracks; t++) {
+        if (t === s.track || busy(t, self)) continue;
+        const id = `track|${s.key}|${s.track}>${t}`;
+        if (used.has(id)) continue;
+        out.push({ id, dist: Math.abs(t - s.track), changes: [['tracks', s.key, t]] });
+      }
+    });
+    return out.sort((a, b) => a.dist - b.dist);
+  }
+
+  // Замечания к готовому чертежу: слипшиеся отрезки и линии сквозь блоки. Это та же
+  // проверка, что в tests/helpers.js (layoutProblems); здесь она нужна, чтобы
+  // сравнивать проходы починки между собой.
+  const spanLen = (a1, a2, b1, b2) => Math.min(Math.max(a1, a2), Math.max(b1, b2))
+    - Math.max(Math.min(a1, a2), Math.min(b1, b2));
+  const hitsBlock = (s, b) => Math.min(s.x1, s.x2) < b.x + b.w - 0.5
+    && Math.max(s.x1, s.x2) > b.x + 0.5
+    && Math.min(s.y1, s.y2) < b.y + b.h - 0.5
+    && Math.max(s.y1, s.y2) > b.y + 0.5;
+
+  function schemeProblems(M) {
+    const segs = [];
+    const bad = new Set();
+    M.conns.forEach(c => c.pts.forEach((p, k) => {
+      const q = c.pts[k + 1];
+      if (!q) return;
+      segs.push({
+        c, k, x1: p[0], y1: p[1], x2: q[0], y2: q[1],
+        horizontal: Math.abs(p[1] - q[1]) < 0.01,
+        length: Math.hypot(q[0] - p[0], q[1] - p[1]),
+      });
+    }));
+    let count = 0;
+    for (let a = 0; a < segs.length; a++) {
+      for (let b = a + 1; b < segs.length; b++) {
+        const A = segs[a], B = segs[b];
+        if (A.c === B.c || A.horizontal !== B.horizontal) continue;
+        if (A.length < 0.01 || B.length < 0.01) continue;
+        const len = A.horizontal
+          ? (Math.abs(A.y1 - B.y1) < 0.05 ? spanLen(A.x1, A.x2, B.x1, B.x2) : 0)
+          : (Math.abs(A.x1 - B.x1) < 0.05 ? spanLen(A.y1, A.y2, B.y1, B.y2) : 0);
+        if (len > 1.5) { count++; bad.add(keyOfConn(A.c)); bad.add(keyOfConn(B.c)); }
+      }
+    }
+    const blocks = M.levels ? M.levels.flatMap(L => L.blocks) : M.blocks;
+    segs.forEach(s => {
+      if (s.length < 0.01) { count++; bad.add(keyOfConn(s.c)); return; }
+      blocks.forEach(b => {
+        if (b !== s.c.src && b !== s.c.tgt && hitsBlock(s, b)) { count++; bad.add(keyOfConn(s.c)); }
+      });
+    });
+    return { count, bad };
+  }
+
+  const keyOfConn = (c) => c.src.id + '>' + c.tgt.id;
+
+  // Подбор ширины межколоночного зазора — как раньше, с учётом ходов починки.
+  function fitGap(state, opts) {
+    let M = null, gapx = GAP_MIN;
+    for (let i = 0; i < 4; i++) {
+      M = layout(state, gapx, opts);
+      if (M.needGap <= gapx) break;
+      gapx = M.needGap;
+    }
+    return M;
+  }
+
+  // Сетка полос: ширина листа и число каналов в каждой полосе.
+  const bandGrid = (M) =>
+    M.width + '|' + [...M.levels.flatMap(L => L.bands), M.C1, M.C2].map(b => b.tracks).join(',');
+  // Положение блоков: по нему видно, что ход не перестроил уровни целиком.
+  const poseOf = (M) => M.levels.flatMap(L => L.blocks).map(b => b.id + ':' + b.x + ':' + b.y).join('|');
+  // Концы линии — точки на гранях блоков.
+  const endsOf = (c) => [c.pts[0], c.pts[c.pts.length - 1]]
+    .map(p => p[0].toFixed(2) + ',' + p[1].toFixed(2)).join(' ');
+
+  // Последний заход: наложение осталось, и пересчёт чертежа уже ничего не даёт.
+  // Двигаем одну из слипшихся вертикалей прямо в готовом маршруте: точка на грани
+  // блока переезжает вдоль этой грани, точка в зазоре — на свободное место зазора.
+  // Остальные линии при этом не пересчитываются и не сдвигаются.
+  const DELTAS = [3, -3, 5, -5, 6, -6, 7, -7, 10, -10, 14, -14, 20, -20];
+
+  // Пределы сдвига точки по грани блока; null — грань вертикальная, x не двигаем.
+  function faceRange(block, pt) {
+    if (!block) return null;
+    const top = Math.abs(pt[1] - block.y) < 0.6;
+    const bottom = Math.abs(pt[1] - (block.y + block.h)) < 0.6;
+    if (!top && !bottom) return null;
+    return [block.x + 6, block.x + block.w - 6];
+  }
+
+  function fixVerticals(M) {
+    const count = (X) => schemeProblems(X).count;
+    let best = { M, count: count(M) };
+    for (let step = 0; step < 12 && best.count; step++) {
+      let applied = false;
+      for (const pair of verticalClashes(best.M.conns)) {
+        const options = [];
+        pair.forEach(seg => {
+          const c = seg.c;
+          // Концы RS-485 между шкафами стоят после стрелок сигналов — их не двигаем.
+          if (c.cabLink) return;
+          const last = c.pts.length - 1;
+          let lo = -Infinity, hi = Infinity;
+          if (seg.k === 0) {
+            const r = faceRange(c.src, c.pts[0]);
+            if (!r) { lo = hi = seg.x; } else { lo = Math.max(lo, r[0]); hi = Math.min(hi, r[1]); }
+          }
+          if (seg.k === last - 1) {
+            const r = faceRange(c.tgt, c.pts[last]);
+            if (!r) { lo = hi = seg.x; } else { lo = Math.max(lo, r[0]); hi = Math.min(hi, r[1]); }
+          }
+          if (lo > hi) return;
+          const xs = DELTAS.map(d => seg.x + d);
+          ['out', 'in'].forEach(side => {
+            const app = side === 'out' ? c.sApp : c.tApp;
+            if (!app || !app.run || Math.abs(app.run.ax - seg.x) > 0.05) return;
+            const { gl, limit } = app.run;
+            for (let i = 0; i < 4; i++) xs.push(gl + SLOT_M + i * SLOT, gl + limit - SLOT_M - i * SLOT);
+          });
+          xs.filter(x => x >= lo && x <= hi && Math.abs(x - seg.x) > 0.5)
+            .forEach(x => options.push({ seg, x }));
+        });
+        options.sort((a, b) => Math.abs(a.x - a.seg.x) - Math.abs(b.x - b.seg.x));
+        for (const { seg, x } of options) {
+          const pts = seg.c.pts.map((p, i) => (i === seg.k || i === seg.k + 1 ? [x, p[1]] : p));
+          // Соседние горизонтали не должны выродиться в точку.
+          const jammed = pts.some((p, i) => {
+            const q = pts[i + 1];
+            return q && Math.abs(p[0] - q[0]) < 0.01 && Math.abs(p[1] - q[1]) < 0.01;
+          });
+          if (jammed) continue;
+          const moved = { ...seg.c, pts };
+          const M2 = { ...best.M, conns: best.M.conns.map(c => (c === seg.c ? moved : c)) };
+          const c2 = count(M2);
+          if (c2 < best.count) {
+            best = { M: M2, count: c2 };
+            applied = true;
+            break;
+          }
+        }
+        if (applied) break;
+      }
+      if (!applied) break;
+    }
+    return best.M;
+  }
+
+  // Починка трассировки идёт тремя заходами: перебор ходов по первому наложению,
+  // затем мелкие места в зазоре, затем прямой сдвиг слипшейся вертикали в готовом
+  // маршруте. Уже правильные линии при этом не перерисовываются.
+  function layoutWithRepair(state) {
+    const base = fitGap(state, {});
+    const baseReport = schemeProblems(base);
+
+    const over = { nudges: new Map(), slots: new Map(), tracks: new Map() };
+    const used = new Set();
+    let best = { M: base, count: baseReport.count };
+
+    const baseGrid = bandGrid(base);
+
+    const moveOptions = (hard) => ({
+      nudges: over.nudges, slots: over.slots, tracks: over.tracks, hard,
+    });
+    const applyMove = (move) => move.changes.map(([map, key, value]) => {
+      const prev = over[map].has(key) ? over[map].get(key) : undefined;
+      over[map].set(key, value);
+      return [map, key, prev];
+    });
+    const revertMove = (saved) => saved.forEach(([map, key, prev]) => {
+      if (prev === undefined) over[map].delete(key);
+      else over[map].set(key, prev);
+    });
+    // Ход принимается, только если сетка полос не изменилась: иначе лист уезжает
+    // целиком и опорные маршруты перестают совпадать. Ходы, которые не улучшают
+    // чертёж, но и не портят его, разрешены: они бывают нужны как промежуточный шаг.
+    const accept = (hard) => {
+      const M = fitGap(state, moveOptions(hard));
+      if (bandGrid(M) !== baseGrid) return false;
+      const report = schemeProblems(M);
+      if (report.count > best.count) return false;
+      best = { M, count: report.count };
+      return true;
+    };
+    // Ходы перебираются от первого наложения: сдвиг конца, переезд места в зазоре,
+    // перестановка канала. Неудачный ход не отменяет остальные и не повторяется.
+    const pass = (hard) => {
+      for (let step = 0; step < 160 && best.count; step++) {
+        let applied = false;
+        for (const pair of verticalClashes(best.M.conns)) {
+          const candidates = [
+            ...nudgeCandidates(pair, used, best.M.conns),
+            ...slotCandidates(pair, used, best.M.conns),
+            ...trackCandidates(pair, used),
+          ];
+          for (const move of candidates) {
+            if (used.has(move.id)) continue;
+            used.add(move.id);
+            const saved = applyMove(move);
+            if (accept(hard)) { applied = true; break; }
+            revertMove(saved);
+          }
+          if (applied) break;
+        }
+        if (!applied) break;
+      }
+    };
+
+    // Второй заход: строгие ходы кончились, а наложения остались. Разрешаем встать
+    // на мелкое место в зазоре рядом с занятым, но только если от этого не съезжают
+    // места выходов и входов на гранях блоков у уже нарисованных правильно линий.
+    const aggressive = () => {
+      if (!best.count) return;
+      const ref = best.M;
+      const refReport = schemeProblems(ref);
+      const refPose = poseOf(ref);
+      // Места выходов и входов на гранях блоков не двигаем: это опорные точки
+      // чертежа, по ним сверяется трассировка.
+      const refEnds = new Map();
+      ref.conns.forEach(c => {
+        if (!refReport.bad.has(keyOfConn(c))) refEnds.set(keyOfConn(c), endsOf(c));
+      });
+      // Внутренние изломы соседних правильных линий могут переехать на другой
+      // канал — это не меняет чертёж, а вот места на гранях блоков меняют.
+      const calm = (M) => M.width === ref.width && poseOf(M) === refPose
+        && M.conns.every(c => !refEnds.has(keyOfConn(c)) || endsOf(c) === refEnds.get(keyOfConn(c)));
+      for (let step = 0; step < 160 && best.count; step++) {
+        let applied = false;
+        for (const pair of verticalClashes(best.M.conns)) {
+          const candidates = slotCandidates(pair, used, best.M.conns, true);
+          for (const move of candidates) {
+            if (used.has(move.id)) continue;
+            const saved = applyMove(move);
+            const M = fitGap(state, moveOptions(false));
+            const count = schemeProblems(M).count;
+            if (calm(M) && count < best.count) {
+              used.add(move.id);
+              best = { M, count };
+              applied = true;
+              break;
+            }
+            revertMove(saved);
+          }
+          if (applied) break;
+        }
+        if (!applied) break;
+      }
+    };
+
+    pass(false);
+    // Ходы не помогли: пробуем жёсткий порядок каналов и снова ходы.
+    if (best.count) { accept(true); pass(true); }
+    aggressive();
+    return fixVerticals(best.M);
+  }
+
   // ---------- Описания блоков ----------
   function blockLines(b, state) {
     const it = b.item;
@@ -627,13 +1082,9 @@
   function buildScheme(state) {
     const { project, autoCabs, netCabs } = state;
 
-    // Ширина межколоночного зазора подбирается под число вертикалей в нём.
-    let M = null, gapx = GAP_MIN;
-    for (let i = 0; i < 4; i++) {
-      M = layout(state, gapx);
-      if (M.needGap <= gapx) break;
-      gapx = M.needGap;
-    }
+    // Раскладка с починкой наложений: первый проход — как в backup, дальше концы
+    // наложившихся связей разводятся на полшага (ширина зазора подбирается там же).
+    const M = layoutWithRepair(state);
     const { width, LV, levels, conns, ext } = M;
     const levelX = MARGIN, levelW = width - 2 * MARGIN;
 
@@ -796,8 +1247,10 @@
     const cells = [];
     let eid = 0;
 
+    // id приходит из файла проекта и может содержать любые символы: в XML его
+    // экранируем так же, как значения, иначе файл .drawio перестаёт разбираться.
     const vtx = (id, value, x, y, w, h, style) =>
-      cells.push(`<mxCell id="${id}" value="${xesc(value)}" style="${style}" vertex="1" parent="1"><mxGeometry x="${R(x)}" y="${R(y)}" width="${R(w)}" height="${R(h)}" as="geometry"/></mxCell>`);
+      cells.push(`<mxCell id="${xesc(id)}" value="${xesc(value)}" style="${style}" vertex="1" parent="1"><mxGeometry x="${R(x)}" y="${R(y)}" width="${R(w)}" height="${R(h)}" as="geometry"/></mxCell>`);
     const edge = (value, style, attrs, geometry) =>
       cells.push(`<mxCell id="e${eid++}" value="${xesc(value)}" style="${style}" edge="1" parent="1"${attrs}><mxGeometry relative="1" as="geometry">${geometry}</mxGeometry></mxCell>`);
 
@@ -820,19 +1273,19 @@
       const entryX = ((c.tx - T.x) / T.w).toFixed(3), entryY = c.tEdge === 'top' ? 0 : 1;
       const inner = c.pts.slice(1, -1).map(p => `<mxPoint x="${R(p[0])}" y="${R(p[1])}"/>`).join('');
       edge('', `edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeWidth=2;strokeColor=${c.color};exitX=${exitX};exitY=${exitY};exitDx=0;exitDy=0;entryX=${entryX};entryY=${entryY};entryDx=0;entryDy=0;`,
-        ` source="b_${S.id}" target="b_${T.id}"`, `<Array as="points">${inner}</Array>`);
+        ` source="b_${xesc(S.id)}" target="b_${xesc(T.id)}"`, `<Array as="points">${inner}</Array>`);
     });
 
     const optic = COLORS['Оптика'];
     m.ext.forEach(e => {
       const exitY = ((e.y - e.b.y) / e.b.h).toFixed(3);
       edge(e.label ? 'Внешняя связь' : '', `endArrow=block;endFill=1;dashed=1;dashPattern=7 4;html=1;strokeWidth=2;strokeColor=${optic};fontColor=${optic};fontSize=9;verticalAlign=bottom;exitX=1;exitY=${exitY};exitDx=0;exitDy=0;`,
-        ` source="b_${e.b.id}"`, `<mxPoint x="${R(e.x2)}" y="${R(e.y)}" as="targetPoint"/>`);
+        ` source="b_${xesc(e.b.id)}"`, `<mxPoint x="${R(e.x2)}" y="${R(e.y)}" as="targetPoint"/>`);
     });
 
     m.signals.forEach(s => {
       edge(s.label, `endArrow=block;endFill=1;html=1;strokeWidth=2;strokeColor=${s.color};fontColor=${s.color};fontSize=9;fontStyle=1;verticalAlign=bottom;exitX=${s.exitX.toFixed(3)};exitY=1;exitDx=0;exitDy=0;`,
-        ` source="b_${s.block.id}"`, `<mxPoint x="${R(s.x)}" y="${R(s.y2)}" as="targetPoint"/>`);
+        ` source="b_${xesc(s.block.id)}"`, `<mxPoint x="${R(s.x)}" y="${R(s.y2)}" as="targetPoint"/>`);
     });
 
     const lg = m.legend;
@@ -854,9 +1307,9 @@
 
   return {
     COLORS, NAME_BY_COLOR, OP_TYPES, OP_LINKS, AUTO_UPLINKS, AUTO_UPLINK_OPTIONS, UPLINK_NONE, KVM_PANEL_ID,
-    PROJECT_DEFAULTS, ITEM_DEFAULTS, FORMAT, FORMAT_VERSION, STORAGE_KEY,
-    PER_ROW_MAX, RASTER_SCALE, RASTER_MAX_PIXELS,
-    uid, fit, pad2, clampPerRow, rasterScale, signalLabel, signalsOf, fileNameOf, routeBand,
+    PROJECT_DEFAULTS, ITEM_DEFAULTS, FORMAT, FORMAT_VERSION, STORAGE_KEY, STORAGE_BACKUP_KEY,
+    PER_ROW_MAX, COUNT_MAX, RASTER_SCALE, RASTER_MAX_PIXELS,
+    uid, fit, pad2, clampPerRow, toCount, rasterScale, signalLabel, signalsOf, fileNameOf, routeBand,
     createDefaultState, newOpItem, newRack, newNetCab, newAutoCab,
     serializeState, normalizeState, parseState, makeResolvers,
     buildScheme, toSvg, toDrawio,

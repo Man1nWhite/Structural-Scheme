@@ -8,7 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 const { ROOT, read } = require('./helpers');
 const { FILES } = require('../scripts/vendor.js');
-const { build, OUT, SHELL } = require('../scripts/build.js');
+const { build, inlineCode, inlineCss, OUT, SHELL } = require('../scripts/build.js');
 
 test('каркас страницы ссылается на существующие файлы и не ходит в интернет', () => {
   const html = read(SHELL);
@@ -58,4 +58,19 @@ test('src/styles.css собран из актуальных классов (npm 
     '-c', 'tailwind.config.js', '-i', 'src/tailwind.css', '-o', out, '--minify',
   ], { cwd: ROOT, stdio: 'pipe' });
   assert.equal(read('src/styles.css'), fs.readFileSync(out, 'utf8'), 'src/styles.css устарел — выполните npm run build:css');
+});
+
+test('встроенный код не закрывает <script> раньше времени', () => {
+  const { JSDOM } = require('jsdom');
+  const code = 'window.s = "a</script><b>" + "<!--<script>" + "</SCRIPT >";';
+  const dom = new JSDOM(`<script>${inlineCode(code)}</script><p id="after"></p>`, { runScripts: 'dangerously' });
+  assert.equal(dom.window.s, 'a</script><b><!--<script></SCRIPT >');
+  assert.ok(dom.window.document.getElementById('after'), 'разметка после скрипта разобрана');
+  dom.window.close();
+});
+
+test('встроенные стили не закрывают <style> раньше времени', () => {
+  const { JSDOM } = require('jsdom');
+  const doc = new JSDOM(`<style>${inlineCss('a{content:"</STYLE >"}' )}</style><p id="after"></p>`).window.document;
+  assert.ok(doc.getElementById('after'), 'разметка после стилей разобрана');
 });
